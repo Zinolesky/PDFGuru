@@ -1,0 +1,256 @@
+import io
+import json
+import os
+import tempfile
+
+import pymupdf
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw
+
+# Use isolated temp DB and deterministic offline mode during tests
+os.environ["GEMINI_API_KEY"] = "your_gemini_api_key_here"
+_tmp_db_fd, _tmp_db_path = tempfile.mkstemp(suffix="_docufill_test.db")
+os.close(_tmp_db_fd)
+os.environ["DOCUFILL_DB_PATH"] = _tmp_db_path
+
+import main  # noqa: E402
+from main import UPLOADS_DIR, app  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as test_client:
+        yield test_client
+    main.engine.dispose()
+    if os.path.exists(_tmp_db_path):
+        try:
+            os.remove(_tmp_db_path)
+        except OSError:
+            pass
+
+
+def _make_sample_png_bytes(width: int = 240, height: int = 120) -> bytes:
+    img = Image.new("RGB", (width, height), color=(250, 250, 250))
+    draw = ImageDraw.Draw(img)
+    draw.line([(20, 80), (100, 40), (180, 75), (220, 50)], fill=(15, 25, 90), width=4)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _make_sample_pdf_bytes() -> bytes:
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text(pymupdf.Point(50, 70), "UNIVERSAL INTAKE FORM", fontsize=14, fontname="hebo")
+    page.insert_text(pymupdf.Point(50, 125), "First Name:", fontsize=10, fontname="helv")
+    page.draw_line(pymupdf.Point(140, 128), pymupdf.Point(400, 128), color=(0.3, 0.3, 0.3), width=1)
+    page.insert_text(pymupdf.Point(50, 165), "Last Name:", fontsize=10, fontname="helv")
+    page.draw_line(pymupdf.Point(140, 168), pymupdf.Point(400, 168), color=(0.3, 0.3, 0.3), width=1)
+    page.insert_text(pymupdf.Point(50, 215), "Company Stamp:", fontsize=10, fontname="helv")
+    page.draw_rect(pymupdf.Rect(160, 200, 270, 275), color=(0.3, 0.3, 0.3), width=1)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    return pdf_bytes
+
+
+def test_health_check(client: TestClient):
+    res = client.get("/api/health")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "ok"
+    assert "DocuFill" in data["service"]
+    assert "gemini_model" in data
+    assert "gemini_vision_model" in data
+    assert "local_ocr_available" in data
+
+
+def test_seeded_universal_templates_and_scraped_content(client: TestClient):
+    res = client.get("/api/templates")
+    assert res.status_code == 200
+    templates = res.json()
+    # Both the flat General Application Form and the AcroForm Sample should be seeded
+    assert len(templates) >= 2
+    methods = {t["analysis_method"] for t in templates}
+    assert "geometry" in methods
+    assert "acroform" in methods
+
+    template_id = templates[0]["id"]
+    dict_res = client.get(f"/api/templates/{template_id}/dictionary-format")
+    assert dict_res.status_code == 200
+    dict_data = dict_res.json()
+    assert dict_data["template_id"] == template_id
+    assert len(dict_data["fields"]) >= 10
+    assert "First name:" in dict_data["blank_dictionary_text"]
+
+    scraped_res = client.get(f"/api/templates/{template_id}/scraped-content")
+    assert scraped_res.status_code == 200
+    scraped = scraped_res.json()
+    assert len(scraped["pages"]) == templates[0]["page_count"]
+    assert "GENERAL APPLICATION" in scraped["pages"][0]["full_text"]
+
+
+def test_parse_dictionary_endpoint(client: TestClient):
+    raw_text = (
+        "First name: Jordan\n"
+        "Last name: Rivera\n"
+        "Email address: jordan@example.com\n"
+        "Department: Engineering\n"
+    )
+    res = client.post("/api/parse-dictionary", json={"raw_text": raw_text})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["parser_used"] == "dictionary-heuristic"
+    fields = body["fields"]
+    assert fields["first_name"] == "Jordan"
+    assert fields["last_name"] == "Rivera"
+    assert fields["full_name"] == "Jordan Rivera"
+    assert fields["email"] == "jordan@example.com"
+    assert fields["department"] == "Engineering"
+
+
+def test_process_image_preview_signature_and_photo(client: TestClient):
+    png_bytes = _make_sample_png_bytes()
+
+    sig_res = client.post(
+        "/api/process-image-preview",
+        data={"mode": "signature", "threshold": "205", "rotate_deg": "90"},
+        files={"image_file": ("sig.png", png_bytes, "image/png")},
+    )
+    assert sig_res.status_code == 200
+    assert sig_res.headers["content-type"] == "image/png"
+    assert sig_res.content.startswith(b"\x89PNG")
+
+    photo_res = client.post(
+        "/api/process-image-preview",
+        data={"mode": "photo", "rotate_deg": "0", "smart_crop": "true"},
+        files={"image_file": ("photo.png", png_bytes, "image/png")},
+    )
+    assert photo_res.status_code == 200
+    assert photo_res.content.startswith(b"\x89PNG")
+
+
+def test_profiles_crud_lifecycle(client: TestClient):
+    create_res = client.post(
+        "/api/profiles",
+        json={"name": "Jordan Profile", "data": {"first_name": "Jordan", "email": "jordan@example.com"}},
+    )
+    assert create_res.status_code == 200
+    prof = create_res.json()
+    prof_id = prof["id"]
+    assert prof["name"] == "Jordan Profile"
+
+    list_res = client.get("/api/profiles")
+    assert list_res.status_code == 200
+    assert any(p["id"] == prof_id for p in list_res.json())
+
+    upd_res = client.put(
+        f"/api/profiles/{prof_id}",
+        json={"name": "Jordan Updated", "data": {"first_name": "Jordan", "city": "Toronto"}},
+    )
+    assert upd_res.status_code == 200
+    assert upd_res.json()["data"]["city"] == "Toronto"
+
+    del_res = client.delete(f"/api/profiles/{prof_id}")
+    assert del_res.status_code == 200
+
+
+def test_upload_duplicate_same_page_mappings_generate_and_disk_cleanup(client: TestClient):
+    pdf_bytes = _make_sample_pdf_bytes()
+    upload_res = client.post(
+        "/api/templates",
+        data={"document_name": "CI Universal Form", "auto_analyze": "true", "use_vision": "false"},
+        files={"pdf_file": ("ci_universal_form.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert upload_res.status_code == 200
+    created = upload_res.json()
+    template_id = created["id"]
+    pdf_filename = created["pdf_filename"]
+    assert created["name"] == "CI Universal Form"
+    assert os.path.exists(os.path.join(UPLOADS_DIR, pdf_filename))
+
+    try:
+        # Persist two identical field_keys on the same page + a custom image slot
+        mappings_payload = [
+            {
+                "type": "text",
+                "field_key": "first_name",
+                "label": "First name",
+                "question_text": "First Name:",
+                "x_pct": 0.24,
+                "y_pct": 0.13,
+                "width_pct": 0.42,
+                "height_pct": 0.025,
+                "page_number": 1,
+                "font_size": 10.5,
+            },
+            {
+                "type": "text",
+                "field_key": "first_name",
+                "label": "First name",
+                "question_text": "Repeated First Name:",
+                "x_pct": 0.24,
+                "y_pct": 0.18,
+                "width_pct": 0.42,
+                "height_pct": 0.025,
+                "page_number": 1,
+                "font_size": 10.5,
+            },
+            {
+                "type": "image",
+                "field_key": "company_stamp",
+                "label": "Company stamp",
+                "x_pct": 0.27,
+                "y_pct": 0.24,
+                "width_pct": 0.18,
+                "height_pct": 0.09,
+                "page_number": 1,
+            },
+        ]
+        save_res = client.put(f"/api/templates/{template_id}/mappings", json=mappings_payload)
+        assert save_res.status_code == 200
+        assert len(save_res.json()) == 3
+
+        # Generate stamped PDF with dynamic image_slot__company_stamp
+        stamp_png = _make_sample_png_bytes()
+        gen_res = client.post(
+            "/api/generate-pdf",
+            data={
+                "template_id": str(template_id),
+                "form_data": json.dumps({"first_name": "Adaeze"}),
+                "image_slots_meta": json.dumps(
+                    {"company_stamp": {"mode": "signature", "rotate_deg": 90, "threshold": 205}}
+                ),
+            },
+            files={"image_slot__company_stamp": ("stamp.png", stamp_png, "image/png")},
+        )
+        assert gen_res.status_code == 200
+        assert gen_res.headers["content-type"] == "application/pdf"
+        assert gen_res.content.startswith(b"%PDF-")
+
+        out_doc = pymupdf.open(stream=gen_res.content, filetype="pdf")
+        assert out_doc[0].get_text("text").count("Adaeze") == 2
+        assert len(out_doc[0].get_images()) == 1
+        out_doc.close()
+    finally:
+        del_res = client.delete(f"/api/templates/{template_id}")
+        assert del_res.status_code == 200
+        # Verify uploaded PDF file was cleaned up from disk
+        assert not os.path.exists(os.path.join(UPLOADS_DIR, pdf_filename))
+
+
+def test_optional_access_token_middleware(client: TestClient):
+    os.environ["DOCUFILL_ACCESS_TOKEN"] = "secret-test-token"
+    try:
+        # Health stays open
+        assert client.get("/api/health").status_code == 200
+        # Protected route rejects missing token
+        assert client.get("/api/templates").status_code == 401
+        # Accepts X-API-Key or Bearer token
+        assert client.get("/api/templates", headers={"X-API-Key": "secret-test-token"}).status_code == 200
+        assert (
+            client.get("/api/templates", headers={"Authorization": "Bearer secret-test-token"}).status_code
+            == 200
+        )
+    finally:
+        os.environ.pop("DOCUFILL_ACCESS_TOKEN", None)

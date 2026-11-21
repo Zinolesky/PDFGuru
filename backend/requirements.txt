@@ -1,0 +1,13 @@
+﻿anyio>=4.8.0
+fastapi>=0.115.0
+google-genai>=3.2.0
+httpx>=0.28.0
+numpy>=2.0.0
+pillow>=11.0.0
+pydantic>=2.12.5
+pymupdf>=1.25.0
+python-dotenv>=1.0.1
+python-multipart>=0.0.20
+SQLAlchemy>=2.0.36
+sqlmodel>=0.0.22
+uvicorn>=0.34.0
