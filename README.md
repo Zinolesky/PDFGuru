@@ -1,6 +1,6 @@
-# DocuFill AI — Universal PDF Content Scraper & Form Filler (PWA)
+# PDFGuru — Universal PDF Scraper & Form Filler (PWA)
 
-**DocuFill AI** is a full-stack Progressive Web App (PWA) that scrapes any PDF document — interactive AcroForm PDFs, flat digital/vector forms, multi-page contracts, or scanned image paperwork — detects which text is a **question/prompt** and exactly **where the answer goes**, generates a copyable `Key: Value` dictionary template, and stamps completed text, checkboxes, photos, stamps, and transparent signatures directly onto the PDF.
+**PDFGuru** — Upload any PDF to scrape structured data (tables, sections, key-values), auto-detect fillable fields with Gemini Vision + vector geometry, and stamp clean PDFs.
 
 ---
 
@@ -23,26 +23,27 @@
 ## 2. Project Structure
 
 ```text
-pdf-auto/
+PDFGuru/
 ├── backend/
 │   ├── assets/fonts/DejaVuSans.ttf  # Embedded Unicode font (₦, €, £, ¥, accents)
 │   ├── main.py                      # FastAPI server, uploads, scraping, profiles & PDF stamping
 │   ├── models.py                    # Universal SQLModel tables & Pydantic schemas
 │   ├── pdf_scraper.py               # Stage 1: Full text, AcroForm & vector geometry scraper
-│   ├── vision_analyzer.py           # Stage 3: Gemini 4 Interactions API Vision + geometry snap
+│   ├── vision_analyzer.py           # Stage 3: Gemini Interactions API Vision + geometry snap
 │   ├── pdf_analyzer.py              # 4-stage Q->A orchestrator + dictionary format generator
-│   ├── ai_service.py                # Dynamic-schema Gemini 4 & deterministic Key:Value parser
+│   ├── ai_service.py                # Dynamic-schema Gemini & deterministic Key:Value parser
 │   ├── pdf_service.py               # Zero-drop auto-fit Unicode stamper + NumPy signature processor
 │   ├── seed.py                      # Seeds universal flat & AcroForm demo PDFs + demo media
 │   ├── requirements.txt             # UTF-8 Python dependencies
 │   └── tests/                       # Comprehensive pytest suite
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx                  # DocuFill AI PWA shell & mode switcher
+│   │   ├── App.jsx                  # PDFGuru PWA shell & mode switcher
 │   │   ├── constants.js             # Universal field presets & dictionary helpers
 │   │   └── components/
 │   │       ├── FormFiller.jsx           # Orchestrator with auto-saved drafts
-│   │       ├── DocumentPickerCard.jsx   # Upload, select, delete, re-scan & Scraped Text modal
+│   │       ├── DocumentPickerCard.jsx   # Upload, select, delete & re-scan documents
+│   │       ├── ScrapedDataView.jsx      # First-class scraped tables, key-values, sections & JSON export
 │   │       ├── DictionaryWorkbench.jsx  # Copy/share Key:Value format & AI extraction
 │   │       ├── DynamicFormFields.jsx    # Section-grouped text, multiline & checkbox inputs
 │   │       ├── MediaStudio.jsx          # Dynamic slots for any photo/signature/stamp + debounce
@@ -64,8 +65,8 @@ pdf-auto/
 cd backend
 .\.venv\Scripts\uvicorn main:app --host 127.0.0.1 --port 8005 --reload
 ```
-- Optional: Copy `backend/.env.example` to `backend/.env` and add `GEMINI_API_KEY` to enable Gemini 4 Vision Q→A detection (including scanned/image-only PDFs) and AI unstructured-text extraction.
-- Without a key, DocuFill AI runs completely offline using AcroForm extraction, vector geometry Q→A detection, and deterministic dictionary parsing.
+- Optional: Copy `backend/.env.example` to `backend/.env` and add `GEMINI_API_KEY` to enable Gemini Vision Q→A detection (including scanned/image-only PDFs) and AI unstructured-text extraction.
+- Without a key, PDFGuru runs completely offline using AcroForm extraction, vector geometry Q→A detection, and deterministic dictionary parsing.
 - Health check: `http://127.0.0.1:8005/api/health` | Swagger UI: `http://127.0.0.1:8005/docs`.
 
 ### Frontend (`/frontend`)

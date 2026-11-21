@@ -10,9 +10,9 @@ from PIL import Image, ImageDraw
 
 # Use isolated temp DB and deterministic offline mode during tests
 os.environ["GEMINI_API_KEY"] = "your_gemini_api_key_here"
-_tmp_db_fd, _tmp_db_path = tempfile.mkstemp(suffix="_docufill_test.db")
+_tmp_db_fd, _tmp_db_path = tempfile.mkstemp(suffix="_pdfguru_test.db")
 os.close(_tmp_db_fd)
-os.environ["DOCUFILL_DB_PATH"] = _tmp_db_path
+os.environ["PDFGURU_DB_PATH"] = _tmp_db_path
 
 import main  # noqa: E402
 from main import UPLOADS_DIR, app  # noqa: E402
@@ -59,7 +59,7 @@ def test_health_check(client: TestClient):
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "ok"
-    assert "DocuFill" in data["service"]
+    assert "PDFGuru" in data["service"]
     assert "gemini_model" in data
     assert "gemini_vision_model" in data
     assert "local_ocr_available" in data
@@ -240,7 +240,7 @@ def test_upload_duplicate_same_page_mappings_generate_and_disk_cleanup(client: T
 
 
 def test_optional_access_token_middleware(client: TestClient):
-    os.environ["DOCUFILL_ACCESS_TOKEN"] = "secret-test-token"
+    os.environ["PDFGURU_ACCESS_TOKEN"] = "secret-test-token"
     try:
         # Health stays open
         assert client.get("/api/health").status_code == 200
@@ -253,4 +253,4 @@ def test_optional_access_token_middleware(client: TestClient):
             == 200
         )
     finally:
-        os.environ.pop("DOCUFILL_ACCESS_TOKEN", None)
+        os.environ.pop("PDFGURU_ACCESS_TOKEN", None)

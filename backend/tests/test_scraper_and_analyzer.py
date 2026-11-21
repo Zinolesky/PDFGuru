@@ -164,7 +164,7 @@ def test_multipage_contract_ignores_prose_and_detects_footer_signature():
 
 
 def test_scanned_image_pdf_honest_offline_and_mocked_vision_hybrid():
-    """Creates an image-only scanned PDF and tests both offline honesty and mocked Gemini 4 Vision."""
+    """Creates an image-only scanned PDF and tests both offline honesty and mocked Gemini Vision."""
     img = Image.new("RGB", (600, 850), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
     draw.rectangle([40, 40, 560, 100], fill=(20, 35, 65))
@@ -185,7 +185,7 @@ def test_scanned_image_pdf_honest_offline_and_mocked_vision_hybrid():
         assert offline_res["mappings"] == []
         assert any("scanned" in w.lower() for w in offline_res["analysis_summary"]["warnings"])
 
-        # Mocked Gemini 4 Vision call via Interactions API
+        # Mocked Gemini Vision call via Interactions API
         fake_vision_json = json.dumps(
             {
                 "is_fillable_page": True,

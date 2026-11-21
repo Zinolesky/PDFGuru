@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: docufill-backend
+    container_name: pdfguru-backend
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -12,11 +12,11 @@ services:
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-gemini-3.5-flash-lite}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
-      - DOCUFILL_ACCESS_TOKEN=${DOCUFILL_ACCESS_TOKEN:-}
-      - DOCUFILL_DB_PATH=/app/data/docufill.db
+      - PDFGURU_ACCESS_TOKEN=${PDFGURU_ACCESS_TOKEN:-}
+      - PDFGURU_DB_PATH=/app/data/pdfguru.db
     volumes:
-      - docufill_uploads:/app/uploads
-      - docufill_data:/app/data
+      - pdfguru_uploads:/app/uploads
+      - pdfguru_data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
       interval: 20s
@@ -28,7 +28,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: docufill-frontend
+    container_name: pdfguru-frontend
     restart: unless-stopped
     ports:
       - "5173:80"
@@ -37,5 +37,5 @@ services:
         condition: service_healthy
 
 volumes:
-  docufill_uploads:
-  docufill_data:
+  pdfguru_uploads:
+  pdfguru_data:

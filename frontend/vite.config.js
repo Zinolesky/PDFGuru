@@ -20,10 +20,10 @@ export default defineConfig({
         navigateFallbackDenylist: [/^\/api\//],
       },
       manifest: {
-        name: 'DocuFill AI — Universal PDF Scraper & Form Filler',
-        short_name: 'DocuFill AI',
+        name: 'PDFGuru — Universal PDF Scraper & Form Filler',
+        short_name: 'PDFGuru',
         description:
-          'Upload any PDF document, scrape its content, auto-detect questions and answer areas, generate a copyable Key:Value format, and stamp completed PDFs.',
+          'Upload any PDF to scrape structured data (tables, sections, key-values), auto-detect fillable fields with Gemini Vision + vector geometry, and stamp clean PDFs.',
         theme_color: '#0f172a',
         background_color: '#f8fafc',
         display: 'standalone',

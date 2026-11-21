@@ -17,7 +17,7 @@ import {
   isSignatureLikeKey,
 } from '../constants';
 
-const DRAFT_PREFIX = 'docufill_draft_v3_';
+const DRAFT_PREFIX = 'pdfguru_draft_v3_';
 
 export default function FormFiller({
   activeTemplate,
@@ -542,7 +542,7 @@ export default function FormFiller({
     const docSlug = (activeTemplate?.name || 'Document')
       .trim()
       .replace(/[^a-zA-Z0-9]+/g, '_');
-    return `DocuFill_${docSlug}_${personSlug}.pdf`;
+    return `PDFGuru_${docSlug}_${personSlug}.pdf`;
   };
 
   const handleDownloadPdf = () => {

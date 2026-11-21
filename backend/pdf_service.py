@@ -31,7 +31,7 @@ def _resolve_unicode_font_path() -> Optional[str]:
 
 
 UNICODE_FONT_PATH = _resolve_unicode_font_path()
-UNICODE_FONT_NAME = "docufill_uni"
+UNICODE_FONT_NAME = "pdfguru_uni"
 
 
 def process_signature_transparency(

@@ -1,4 +1,4 @@
-name: DocuFill AI CI/CD Pipeline
+name: PDFGuru CI/CD Pipeline
 
 on:
   push:
@@ -71,7 +71,7 @@ jobs:
       - name: Upload Frontend Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: docufill-frontend-dist
+          name: pdfguru-frontend-dist
           path: frontend/dist
           retention-days: 7
 
@@ -93,7 +93,7 @@ jobs:
           context: ./backend
           file: ./backend/Dockerfile
           load: true
-          tags: docufill-backend:ci
+          tags: pdfguru-backend:ci
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
@@ -103,21 +103,21 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           load: true
-          tags: docufill-frontend:ci
+          tags: pdfguru-frontend:ci
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
 
       - name: Container Smoke Test (/api/health)
         run: |
-          docker run -d --name docufill-backend-test -p 8000:8000 docufill-backend:ci
+          docker run -d --name pdfguru-backend-test -p 8000:8000 pdfguru-backend:ci
           for i in $(seq 1 15); do
             if curl -fsS http://127.0.0.1:8000/api/health | grep -q '"status":"ok"'; then
               echo "Backend container is healthy!"
-              docker rm -f docufill-backend-test
+              docker rm -f pdfguru-backend-test
               exit 0
             fi
             sleep 2
           done
-          docker logs docufill-backend-test
-          docker rm -f docufill-backend-test
+          docker logs pdfguru-backend-test
+          docker rm -f pdfguru-backend-test
           exit 1

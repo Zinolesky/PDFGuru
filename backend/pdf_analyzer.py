@@ -1280,7 +1280,7 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
     4-Stage Hybrid Universal PDF Analyzer:
       Stage 1: Full content + vector geometry + AcroForm scrape (PyMuPDF)
       Stage 2: Direct AcroForm extraction with nearest-label Q->A resolver
-      Stage 3: Gemini 4 Multimodal Vision + Geometry Snapping (when GEMINI_API_KEY is configured)
+      Stage 3: Gemini Multimodal Vision + Geometry Snapping (when GEMINI_API_KEY is configured)
       Stage 4: Upgraded Offline Vector-Geometry Q->A Engine (fallback when offline)
 
     Returns a rich dict with:

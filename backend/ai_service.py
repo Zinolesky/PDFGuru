@@ -289,7 +289,7 @@ def parse_input_text(
 ) -> ParseTextResponse:
     """
     Universal parser for filled `Key: Value` dictionaries and unstructured text/messages.
-    Uses deterministic dictionary parsing first, then enhances with Gemini 4 (`gemini-4-hydrogen`)
+    Uses deterministic dictionary parsing first, then enhances with Gemini (`gemini-3.5-flash-lite`)
     via the Interactions API with strict dynamic JSON Schema when GEMINI_API_KEY is configured.
     """
     heuristic_data = _parse_dictionary_and_labels(raw_text, expected_fields)

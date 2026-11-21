@@ -48,7 +48,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-DB_PATH = os.getenv("DOCUFILL_DB_PATH") or os.path.join(BASE_DIR, "docufill.db")
+DB_PATH = os.getenv("PDFGURU_DB_PATH") or os.path.join(BASE_DIR, "pdfguru.db")
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_MB", "25")) * 1024 * 1024
@@ -148,7 +148,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="DocuFill AI — Universal PDF Scraper & Form Filler",
+    title="PDFGuru — Universal PDF Scraper & Form Filler",
     description="Upload any PDF document, scrape its full content, detect questions and answer regions, generate a copyable Key:Value format, and stamp completed PDFs.",
     version="3.0.0",
     lifespan=lifespan,
@@ -173,8 +173,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def optional_access_token_middleware(request: Request, call_next):
-    """Enforces optional DOCUFILL_ACCESS_TOKEN on /api/* endpoints (except /api/health) when set."""
-    expected_token = os.getenv("DOCUFILL_ACCESS_TOKEN", "").strip()
+    """Enforces optional PDFGURU_ACCESS_TOKEN on /api/* endpoints (except /api/health) when set."""
+    expected_token = os.getenv("PDFGURU_ACCESS_TOKEN", "").strip()
     if expected_token and request.url.path.startswith("/api/") and request.url.path != "/api/health":
         if request.method != "OPTIONS":
             auth_hdr = request.headers.get("authorization", "")
@@ -189,7 +189,7 @@ async def optional_access_token_middleware(request: Request, call_next):
 def health_check():
     return {
         "status": "ok",
-        "service": "DocuFill AI Universal PDF Backend",
+        "service": "PDFGuru Universal PDF Backend",
         "gemini_model": get_text_model_name(),
         "gemini_vision_model": get_vision_model_name(),
         "gemini_key_configured": bool(get_gemini_api_key()),
@@ -274,7 +274,7 @@ async def create_template(
 ):
     """
     Uploads ANY PDF document, scrapes its full content & vector geometry, detects questions
-    and answer locations (AcroForm -> Gemini 4 Vision + Geometry Snapping -> Offline Vector Engine),
+    and answer locations (AcroForm -> Gemini Vision + Geometry Snapping -> Offline Vector Engine),
     and returns the ready-to-fill document template.
     """
     if not pdf_file.filename or not pdf_file.filename.lower().endswith(".pdf"):
@@ -719,7 +719,7 @@ async def generate_pdf_endpoint(
         or "Completed"
     )
     safe_person = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(person_label).replace(" ", "_"))
-    filename = f"DocuFill_{safe_doc}_{safe_person}.pdf"
+    filename = f"PDFGuru_{safe_doc}_{safe_person}.pdf"
 
     return Response(
         content=stamped_bytes,

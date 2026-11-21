@@ -194,10 +194,10 @@ export default function App() {
           {/* Left: Brand + Document Switcher */}
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-8 h-8 rounded-lg bg-amber-400 text-slate-950 flex items-center justify-center font-black text-sm shrink-0">
-              DF
+              PG
             </div>
             <span className="text-sm font-extrabold tracking-tight text-white shrink-0">
-              DocuFill
+              PDFGuru
             </span>
 
             {templates.length > 0 && (
