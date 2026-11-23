@@ -1,5 +1,7 @@
 # PDFGuru — Universal PDF Scraper & Form Filler (PWA)
 
+**Live App:** [https://pdfguru-liart.vercel.app](https://pdfguru-liart.vercel.app)
+
 **PDFGuru** — Upload any PDF to scrape structured data (tables, sections, key-values), auto-detect fillable fields with Gemini Vision + vector geometry, and stamp clean PDFs.
 
 ---
