@@ -74,17 +74,28 @@ export default function App() {
       setUploadingPdf(true);
       setAppNotice(null);
       try {
-        const fd = new FormData();
-        fd.append('auto_analyze', 'true');
-        fd.append('use_vision', 'true');
-        fd.append('pdf_file', file);
+        const uploadOnce = async (useVisionFlag) => {
+          const fd = new FormData();
+          fd.append('auto_analyze', 'true');
+          fd.append('use_vision', useVisionFlag ? 'true' : 'false');
+          fd.append('pdf_file', file);
+          return fetch('/api/templates', {
+            method: 'POST',
+            body: fd,
+          });
+        };
 
-        const res = await fetch('/api/templates', {
-          method: 'POST',
-          body: fd,
-        });
+        let res = await uploadOnce(true);
+        // If Vercel Serverless hits a 504 timeout on a large multi-page Vision scan, automatically retry with fast offline geometry/AcroForm
+        if (res.status === 504 || res.status === 502) {
+          res = await uploadOnce(false);
+        }
+
         if (!res.ok) {
-          let detail = 'Failed to upload PDF';
+          let detail =
+            res.status === 413
+              ? 'PDF exceeds Vercel Serverless 4.5 MB upload limit. Please compress or split the PDF.'
+              : `Failed to upload PDF (HTTP ${res.status})`;
           try {
             const err = await res.json();
             detail = err.detail || detail;

@@ -21,8 +21,10 @@ DEFAULT_VISION_MODEL = (
     or os.getenv("GEMINI_MODEL")
     or "gemini-3.5-flash-lite"
 )
-MAX_VISION_PAGES = int(os.getenv("MAX_VISION_PAGES", "20"))
-GEMINI_VISION_TIMEOUT_MS = int(os.getenv("GEMINI_VISION_TIMEOUT_MS", "45000"))
+IS_VERCEL = os.getenv("VERCEL") == "1"
+MAX_VISION_PAGES = int(os.getenv("MAX_VISION_PAGES", "4" if IS_VERCEL else "20"))
+GEMINI_VISION_TIMEOUT_MS = int(os.getenv("GEMINI_VISION_TIMEOUT_MS", "22000" if IS_VERCEL else "45000"))
+VISION_TOTAL_BUDGET_S = float(os.getenv("VISION_TOTAL_BUDGET_S", "42.0" if IS_VERCEL else "110.0"))
 
 OPTION_SUFFIX_RE = re.compile(
     r"_(?:yes|no|none|n_a|na|true|false|ongoing|completed|exempted|male|female|other)$"
@@ -976,14 +978,15 @@ def analyze_pages_with_vision(
 
     # Render target pages once in the main thread (PyMuPDF handles are not thread-safe)
     rendered_inputs: List[Tuple[bytes, Dict[str, Any]]] = []
+    target_px_width = 1100.0 if IS_VERCEL else 1400.0
     doc = pymupdf.open(pdf_path)
     try:
         for page_scrape in pages_to_run:
             idx = page_scrape["page_number"] - 1
             if 0 <= idx < len(doc):
                 page = doc[idx]
-                scale = 1400.0 / max(1.0, float(page.rect.width))
-                scale = max(1.0, min(2.5, scale))
+                scale = target_px_width / max(1.0, float(page.rect.width))
+                scale = max(1.0, min(2.0 if IS_VERCEL else 2.5, scale))
                 pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
                 rendered_inputs.append((pix.tobytes("png"), page_scrape))
     finally:
@@ -997,12 +1000,13 @@ def analyze_pages_with_vision(
     page_ocr_text: Dict[int, str] = {}
     errors: List[str] = []
 
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(rendered_inputs)))) as pool:
-        futures = {
-            pool.submit(_analyze_single_page_vision, client, model_name, png, ps): ps["page_number"]
-            for png, ps in rendered_inputs
-        }
-        for fut in as_completed(futures):
+    pool = ThreadPoolExecutor(max_workers=min(4, max(1, len(rendered_inputs))))
+    futures = {
+        pool.submit(_analyze_single_page_vision, client, model_name, png, ps): ps["page_number"]
+        for png, ps in rendered_inputs
+    }
+    try:
+        for fut in as_completed(futures, timeout=VISION_TOTAL_BUDGET_S):
             pnum = futures[fut]
             try:
                 page_num, page_fields, summary, kvs, ocr_txt, page_err = fut.result()
@@ -1019,6 +1023,11 @@ def analyze_pages_with_vision(
                         page_ocr_text[page_num] = ocr_txt
             except Exception as exc:
                 errors.append(f"Page {pnum}: {exc}")
+    except TimeoutError:
+        unfinished = [str(pnum) for f, pnum in futures.items() if not f.done()]
+        errors.append(f"Vision time budget reached (remaining pages {', '.join(unfinished)} used fast geometry fallback)")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     ordered_mappings: List[Dict[str, Any]] = []
     for _, ps in rendered_inputs:

@@ -1891,6 +1891,11 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
             if pt in ("digital_flat", "scanned_image") or has_sig_cue:
                 vision_candidate_pages.append(p)
 
+    # Prioritize scanned_image pages first for Vision (since digital_flat pages have the Stage 4 vector engine fallback)
+    vision_candidate_pages.sort(
+        key=lambda pg: (0 if pg["page_type"] == "scanned_image" else 1, pg["page_number"])
+    )
+
     has_vision_key = bool(use_vision and get_gemini_api_key())
     vision_model_used: Optional[str] = None
     vision_inspected_pages: set[int] = set()
