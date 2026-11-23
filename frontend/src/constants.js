@@ -156,6 +156,19 @@ export function isSignatureLikeKey(fieldKey = '') {
   return k.includes('sign') || k.includes('initial') || k.includes('stamp') || k.includes('seal');
 }
 
+export function checkboxMatchesValue(fieldVal, matchVal) {
+  if (fieldVal === null || fieldVal === undefined || !matchVal) return false;
+  const vStr = String(fieldVal).trim().toLowerCase();
+  const mStr = String(matchVal).trim().toLowerCase();
+  if (!vStr) return false;
+  if (vStr === mStr) return true;
+  const vCompact = vStr.replace(/[\s\-_]+/g, '');
+  const mCompact = mStr.replace(/[\s\-_]+/g, '');
+  if (vCompact === mCompact) return true;
+  if (mCompact === 'yes' && ['true', '1', 'y', 'checked'].includes(vCompact)) return true;
+  return false;
+}
+
 export function humanizeFieldKey(key, explicitLabel = null) {
   if (explicitLabel && explicitLabel.trim()) return explicitLabel.trim();
   if (FIELD_LABELS[key]) return FIELD_LABELS[key];
@@ -197,12 +210,23 @@ export function buildDocumentDictionarySpec(template) {
   };
 
   const sortedMappings = [...template.mappings].sort((a, b) => {
-    if ((a.page_number || 1) !== (b.page_number || 1)) {
-      return (a.page_number || 1) - (b.page_number || 1);
-    }
-    if (Math.abs((a.y_pct || 0) - (b.y_pct || 0)) > 0.012) {
-      return (a.y_pct || 0) - (b.y_pct || 0);
-    }
+    const pa = a.page_number || 1;
+    const pb = b.page_number || 1;
+    if (pa !== pb) return pa - pb;
+    const yEffA =
+      a.type === 'checkbox'
+        ? a.y_pct || 0
+        : (a.y_pct || 0) + Math.min(0.012, Math.max(0, a.height_pct || 0) * 0.45);
+    const yEffB =
+      b.type === 'checkbox'
+        ? b.y_pct || 0
+        : (b.y_pct || 0) + Math.min(0.012, Math.max(0, b.height_pct || 0) * 0.45);
+    const bandA = Math.round(yEffA / 0.015);
+    const bandB = Math.round(yEffB / 0.015);
+    if (bandA !== bandB) return bandA - bandB;
+    const fA = (a.question_text || '').includes(' — ') || (a.label || '').includes(' — ') ? 1 : 0;
+    const fB = (b.question_text || '').includes(' — ') || (b.label || '').includes(' — ') ? 1 : 0;
+    if (fA !== fB) return fA - fB;
     return (a.x_pct || 0) - (b.x_pct || 0);
   });
 
@@ -242,7 +266,10 @@ export function buildDocumentDictionarySpec(template) {
       if (m.confidence != null && (existing.confidence == null || m.confidence < existing.confidence)) {
         existing.confidence = m.confidence;
       }
-      if (!existing.question_text && m.question_text) {
+      if (
+        m.question_text &&
+        (!existing.question_text || m.question_text.length > existing.question_text.length)
+      ) {
         existing.question_text = m.question_text;
       }
       if (!existing.section && m.section) {

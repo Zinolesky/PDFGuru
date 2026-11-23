@@ -524,18 +524,31 @@ def stamp_pdf(
         elif mapping.type == "checkbox":
             val = data_dict.get(mapping.field_key)
             if _checkbox_matches(val, mapping.match_value):
-                size = 5.0 * scale_factor
-                p1 = pymupdf.Point(x - size * 0.72, y + size * 0.06)
-                p2 = pymupdf.Point(x - size * 0.14, y + size * 0.68)
-                p3 = pymupdf.Point(x + size * 0.88, y - size * 0.74)
+                # Scale checkmark to fit neatly inside narrow `(  )` slots OR larger vector boxes
+                if mapping.width_pct and mapping.height_pct:
+                    slot_w = float(mapping.width_pct) * page_w
+                    slot_h = float(mapping.height_pct) * page_h
+                    fit_w = max(3.6 * scale_factor, slot_w * 0.84)
+                    fit_h = max(4.2 * scale_factor, slot_h * 0.72)
+                    size = max(
+                        2.5 * scale_factor,
+                        min(6.2 * scale_factor, fit_w / 1.55, fit_h / 1.35),
+                    )
+                else:
+                    size = 4.2 * scale_factor
+
+                stroke_w = max(1.15 * scale_factor, min(2.1 * scale_factor, size * 0.42))
+                p1 = pymupdf.Point(x - size * 0.68, y + size * 0.04)
+                p2 = pymupdf.Point(x - size * 0.14, y + size * 0.62)
+                p3 = pymupdf.Point(x + size * 0.82, y - size * 0.70)
                 shape = page.new_shape()
-                shape.draw_line(p1, p2)
-                shape.draw_line(p2, p3)
+                shape.draw_polyline([p1, p2, p3])
                 shape.finish(
                     color=(0.04, 0.15, 0.45),
-                    width=2.1 * scale_factor,
+                    width=stroke_w,
                     lineCap=1,
                     lineJoin=1,
+                    closePath=False,
                 )
                 shape.commit()
 

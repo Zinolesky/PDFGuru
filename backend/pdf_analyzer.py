@@ -443,6 +443,151 @@ def _rect_contains_text(box: Dict[str, Any], lines: List[Dict[str, Any]]) -> Lis
 PAREN_CB_RE = re.compile(
     r"([A-Za-z][A-Za-z0-9\-\s/:?]{0,36}?)\s*([\(\[]\s*[\)\]]|[☐□])"
 )
+_OPTION_CLUTTER_RE = re.compile(
+    r"^(?:(?:yes|no|none|ongoing|completed|exempted|full[\s\-]*time|part[\s\-]*time|freelance|not\s+employed|male|female|other)\s*[\(\[]\s*[\)\]]\s*)+",
+    re.IGNORECASE,
+)
+_FOLLOWUP_PROMPT_RE = re.compile(
+    r"^(?:what\s*/\s*where|why|comment(?:s)?|specify|please\s*(?:specify|state)|details?|explain|reason|"
+    r"if\s+(?:yes|no|so|other(?:s)?|applicable|married|single|employed|exempted)|"
+    r"date\s+of\s+completion|nysc\s+date|when|where|other)\b",
+    re.IGNORECASE,
+)
+_CONDITIONAL_TRIGGER_RE = re.compile(
+    r"\bif\s+(yes|no|so|other(?:s)?|exempted|married|single|employed|applicable)\b",
+    re.IGNORECASE,
+)
+_TRIGGER_OPTION_MAP: Dict[str, set[str]] = {
+    "yes": {"yes"},
+    "no": {"no"},
+    "so": {"yes"},
+    "other": {"other", "others"},
+    "others": {"other", "others"},
+    "exempted": {"exempted"},
+    "married": {"married"},
+    "single": {"single"},
+    "employed": {"employed"},
+    "applicable": {"yes", "applicable"},
+}
+_PRONOUN_BLANK_RE = re.compile(
+    r"^(?:i\s*/\s*we|i|we|my\s*/\s*our|mr\s*/\s*mrs\s*/\s*miss|the\s+undersigned|undersigned)$",
+    re.IGNORECASE,
+)
+_DATE_BLANK_RE = re.compile(
+    r"^(?:dated\s+this|this|day\s+of|month\s+of|in\s+the\s+year|year|of)$",
+    re.IGNORECASE,
+)
+
+
+def _smart_truncate_words(text: str, max_len: int = 34) -> str:
+    """Truncates text at a word boundary without chopping words mid-syllable."""
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    words = cleaned.split(" ")
+    out: List[str] = []
+    cur_len = 0
+    for w in words:
+        sep = 1 if out else 0
+        if cur_len + sep + len(w) <= max_len:
+            out.append(w)
+            cur_len += sep + len(w)
+        else:
+            break
+    return " ".join(out) if out else cleaned[:max_len].rstrip()
+
+
+def _make_followup_field_key(parent_fk: str, suffix_fk: str, max_len: int = 48) -> str:
+    """Combines parent key + follow-up suffix within `max_len` without colliding with `parent_fk`."""
+    p_clean = re.sub(r"_+", "_", (parent_fk or "field").strip("_"))
+    s_clean = re.sub(r"_+", "_", (suffix_fk or "details").strip("_"))
+    if not p_clean or p_clean.startswith("choice_p"):
+        return s_clean[:max_len].rstrip("_")
+    head_budget = max(8, max_len - len(s_clean) - 1)
+    head = p_clean[:head_budget].rstrip("_")
+    combined = f"{head}_{s_clean}"[:max_len].rstrip("_")
+    return combined or s_clean[:max_len]
+
+
+def _resolve_inline_blank_prompt(
+    raw_txt: str,
+    bm_start: int,
+    bm_end: int,
+    clause: str,
+    prefix: str,
+) -> Optional[Tuple[str, str, str]]:
+    """
+    Produces `(field_key, human_label, contextual_question_text)` for inline blank leaders
+    inside prose/legal/undertaking sentences such as `I/we............a subscriber` or
+    `Dated this ____ day of ______`. Returns None for ordinary labeled blanks so default
+    label normalization applies unchanged.
+    """
+    c_clean = re.sub(r"\s+", " ", (clause or "").strip(" ,;:-."))
+    if not c_clean:
+        return None
+
+    def _collapse_leaders(text: str) -> str:
+        return re.sub(r"[_]{4,}|[\.]{4,}", "[___]", text)
+
+    prefix_ctx = _collapse_leaders(raw_txt[:bm_start].strip())[-55:].strip()
+    trailing_raw = raw_txt[bm_end:].strip()
+    trailing_ctx = _collapse_leaders(trailing_raw)[:95].strip()
+    sentence_ctx = _smart_truncate_words(f"{prefix_ctx} [___] {trailing_ctx}".strip(), 140)
+
+    if _PRONOUN_BLANK_RE.match(c_clean):
+        after_lc = trailing_raw.lower()
+        whole_lc = raw_txt.lower()
+        if "subscriber" in after_lc or "subscriber" in whole_lc:
+            fk, fl = "subscriber_full_name", "Subscriber full name"
+        elif "applicant" in after_lc or "applicant" in whole_lc:
+            fk, fl = "applicant_full_name", "Applicant full name"
+        elif "witness" in after_lc or "witness" in whole_lc:
+            fk, fl = "witness_full_name", "Witness full name"
+        else:
+            fk, fl = "declarant_full_name", "Declarant full name"
+        return fk, fl, sentence_ctx
+
+    if _DATE_BLANK_RE.match(c_clean):
+        before_lc = prefix.lower()
+        after_lc = trailing_raw.lower()
+        c_lc = c_clean.lower()
+        if c_lc in ("dated this", "this") or after_lc.startswith("day"):
+            return "agreement_day", "Agreement day", sentence_ctx
+        if "day of" in c_lc or "month of" in c_lc or (c_lc == "of" and "day" in before_lc):
+            return "agreement_month", "Agreement month", sentence_ctx
+        if "year" in c_lc or after_lc.startswith(("20", "19")):
+            return "agreement_year", "Agreement year", sentence_ctx
+
+    return None
+
+
+def _compute_followup_answer_box(
+    ln: Dict[str, Any],
+    container_right_pct: float = 0.92,
+    cell_rect: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, float, float, float]:
+    """
+    Computes the write-in answer box for a trailing inline follow-up prompt (e.g. 'Why:', 'NYSC Date:').
+    When right-hand horizontal room inside a table cell is tight and there is blank space below
+    the prompt line, drops the answer box below the line inside the same cell.
+    """
+    start_x = round(min(container_right_pct - 0.05, ln["x_pct"] + ln["w_pct"] + 0.008), 4)
+    avail_w = round(max(0.06, container_right_pct - start_x), 4)
+    bh = round(max(0.020, min(0.032, ln["h_pct"] * 1.45)), 4)
+    by = round(max(0.005, ln["y_pct"] - 0.002), 4)
+
+    if cell_rect is not None and avail_w < 0.14:
+        line_bot = ln["y_pct"] + ln["h_pct"]
+        cell_bot = cell_rect["y_pct"] + cell_rect["h_pct"]
+        below_space = cell_bot - line_bot
+        if below_space >= 0.018:
+            sub_x = round(cell_rect["x_pct"] + 0.005, 4)
+            sub_y = round(line_bot + 0.003, 4)
+            sub_w = round(max(0.06, cell_rect["w_pct"] - 0.010), 4)
+            sub_h = round(max(0.018, min(0.036, below_space - 0.004)), 4)
+            return sub_x, sub_y, sub_w, sub_h
+
+    return start_x, by, round(max(0.08, avail_w), 4), bh
 
 
 def _extract_inline_paren_checkboxes(
@@ -453,12 +598,15 @@ def _extract_inline_paren_checkboxes(
     context_label: Optional[str] = None,
     context_q_src: Optional[Dict[str, Any]] = None,
     container_right_pct: float = 0.92,
+    text_paren_cbs: Optional[List[Dict[str, Any]]] = None,
+    cell_rect: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Detects parenthetical/bracket blank checkboxes such as:
       'None(  ) Beginner(  ) Intermediate(  ) Advanced(  )'
       'Yes (  ) No (  ) Why:'
     and emits grouped checkbox mappings + any trailing inline text prompt.
+    Uses Stage 1 `rawdict` slot centers when available for pixel-accurate placement.
     Returns True if checkboxes were found and emitted.
     """
     txt = ln["text"].strip()
@@ -476,13 +624,26 @@ def _extract_inline_paren_checkboxes(
         if sep_match:
             inline_prompt = sep_match.group(1).strip()
 
-    q_text = context_label or inline_prompt or f"Choice (Page {page_num})"
+    q_text = (context_label or inline_prompt or f"Choice (Page {page_num})").strip()
     fk, fl = normalize_label_to_key_and_label(q_text)
     if not context_label and not inline_prompt:
         fk = f"choice_p{page_num}_r{int(round(ln['y_pct'] * 100))}"
         fl = "Choice"
 
     q_src = context_q_src or ln
+    line_cy = ln["y_pct"] + ln["h_pct"] * 0.5
+    row_slots = [
+        c
+        for c in (text_paren_cbs or [])
+        if abs(c["cy_pct"] - line_cy) <= 0.018
+        and c["cx_pct"] >= ln["x_pct"] - 0.02
+        and c["cx_pct"] <= ln["x_pct"] + ln["w_pct"] + 0.02
+    ]
+    row_slots.sort(key=lambda c: c["cx_pct"])
+    used_slot_idxs: set[int] = set()
+
+    def _norm_tok(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
     for idx_m, m in enumerate(matches):
         opt_raw = m.group(1).strip()
@@ -496,8 +657,41 @@ def _extract_inline_paren_checkboxes(
             continue
 
         slot_mid = (m.start(2) + m.end(2)) * 0.5 / total_len
-        cb_x = round(max(0.01, min(0.98, ln["x_pct"] + ln["w_pct"] * slot_mid)), 4)
-        cb_y = round(max(0.01, min(0.98, ln["y_pct"] + ln["h_pct"] * 0.5)), 4)
+        approx_x = round(max(0.01, min(0.98, ln["x_pct"] + ln["w_pct"] * slot_mid)), 4)
+        approx_y = round(max(0.01, min(0.98, line_cy)), 4)
+
+        # Prefer exact Stage 1 rawdict character-gap slot when available on this row
+        matched_idx: Optional[int] = None
+        opt_norm = _norm_tok(opt_clean)
+        best_rank: Optional[Tuple[int, float]] = None
+        for si, slot in enumerate(row_slots):
+            if si in used_slot_idxs:
+                continue
+            sb_norm = _norm_tok(slot.get("label_before") or "")
+            sa_norm = _norm_tok(slot.get("label_after") or "")
+            if opt_norm and (sb_norm == opt_norm or sa_norm == opt_norm):
+                tier = 0
+            else:
+                tier = 1
+            rank = (tier, abs(slot["cx_pct"] - approx_x))
+            if (tier == 0 or abs(slot["cx_pct"] - approx_x) <= 0.12) and (
+                best_rank is None or rank < best_rank
+            ):
+                best_rank = rank
+                matched_idx = si
+
+        if matched_idx is not None:
+            used_slot_idxs.add(matched_idx)
+            slot = row_slots[matched_idx]
+            cb_x = slot["cx_pct"]
+            cb_y = slot["cy_pct"]
+            cb_w = slot.get("w_pct")
+            cb_h = slot.get("h_pct")
+        else:
+            cb_x = approx_x
+            cb_y = approx_y
+            cb_w = None
+            cb_h = None
 
         add_mapping_fn(
             {
@@ -509,8 +703,8 @@ def _extract_inline_paren_checkboxes(
                 "match_value": opt_clean[:48],
                 "x_pct": cb_x,
                 "y_pct": cb_y,
-                "width_pct": None,
-                "height_pct": None,
+                "width_pct": cb_w,
+                "height_pct": cb_h,
                 "qx_pct": q_src["x_pct"] if q_src else None,
                 "qy_pct": q_src["y_pct"] if q_src else None,
                 "qw_pct": q_src["w_pct"] if q_src else None,
@@ -518,7 +712,7 @@ def _extract_inline_paren_checkboxes(
                 "page_number": page_num,
                 "font_size": None,
                 "align": "left",
-                "confidence": 0.84,
+                "confidence": 0.86 if matched_idx is not None else 0.84,
                 "detection_source": "geometry",
                 "acroform_field_name": None,
             },
@@ -532,21 +726,27 @@ def _extract_inline_paren_checkboxes(
         tail_clean = tail.rstrip(":? ").strip()
         if tail_clean:
             tfk, tfl = normalize_label_to_key_and_label(tail_clean)
-            if tfk in ("why", "comment", "what_where", "details") and fl and fl != "Choice":
-                short_parent = fl[:28].rstrip()
-                tfl = f"{short_parent} ({tfl})"
-                tfk = f"{fk}_{tfk}"[:48].rstrip("_")
+            has_parent = bool((context_label or inline_prompt) and fl and fl != "Choice")
+            if has_parent:
+                parent_short = _smart_truncate_words(fl.rstrip("?:. "), 34)
+                if _norm_tok(tfl) not in _norm_tok(fl):
+                    tfl = f"{parent_short} — {tfl}"
+                tfk = _make_followup_field_key(fk, tfk)
+                full_q_text = f"{q_text} — {tail}"
+            else:
+                full_q_text = tail
 
-            start_x = round(min(container_right_pct - 0.05, ln["x_pct"] + ln["w_pct"] + 0.008), 4)
-            avail_w = round(max(0.08, container_right_pct - start_x), 4)
-            bh = round(max(0.020, min(0.032, ln["h_pct"] * 1.45)), 4)
-            by = round(max(0.005, ln["y_pct"] - 0.002), 4)
+            start_x, by, avail_w, bh = _compute_followup_answer_box(
+                ln=ln,
+                container_right_pct=container_right_pct,
+                cell_rect=cell_rect,
+            )
             add_mapping_fn(
                 {
                     "type": "text",
                     "field_key": tfk,
                     "label": tfl,
-                    "question_text": tail,
+                    "question_text": full_q_text,
                     "section": _current_section_for_y(by, sections),
                     "match_value": None,
                     "x_pct": start_x,
@@ -676,10 +876,13 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
                     used_line_indices.add(idx_l)
 
     # -------------------------------------------------------------------------
-    # 2. Universal Vector Checkbox / Radio Detection (Left OR Right of Option)
+    # 2. Universal Vector / Glyph Checkbox Detection (Left OR Right of Option)
     # -------------------------------------------------------------------------
+    text_paren_cbs = [c for c in checkbox_shapes if c.get("source") == "text_paren"]
+    vector_or_glyph_cbs = [c for c in checkbox_shapes if c.get("source") != "text_paren"]
+
     cb_rows: List[List[Dict[str, Any]]] = []
-    for cb in sorted(checkbox_shapes, key=lambda c: (round(c["cy_pct"] / 0.015), c["cx_pct"])):
+    for cb in sorted(vector_or_glyph_cbs, key=lambda c: (round(c["cy_pct"] / 0.015), c["cx_pct"])):
         placed = False
         for row in cb_rows:
             if abs(cb["cy_pct"] - row[0]["cy_pct"]) <= 0.018:
@@ -777,8 +980,8 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
                     "match_value": mv,
                     "x_pct": cb["cx_pct"],
                     "y_pct": cb["cy_pct"],
-                    "width_pct": None,
-                    "height_pct": None,
+                    "width_pct": cb.get("w_pct"),
+                    "height_pct": cb.get("h_pct"),
                     "qx_pct": q_src["x_pct"] if q_src else None,
                     "qy_pct": q_src["y_pct"] if q_src else None,
                     "qw_pct": q_src["w_pct"] if q_src else None,
@@ -855,6 +1058,8 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
                                 context_label=left_label_text,
                                 context_q_src=left_q_src,
                                 container_right_pct=cell_right_limit,
+                                text_paren_cbs=text_paren_cbs,
+                                cell_rect=cell,
                             ):
                                 found_cb_in_cell = True
 
@@ -1135,7 +1340,9 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
         row.sort(key=lambda pair: pair[1]["x_pct"])
         for pos, (idx_l, ln) in enumerate(row):
             raw_txt = ln["text"].strip()
-            if len(raw_txt) < 2 or len(raw_txt) > 150 or IGNORE_LINE_PATTERNS.search(raw_txt):
+            has_inline_blank = bool(re.search(r"[_]{4,}|[\.]{5,}", raw_txt))
+            max_line_len = 400 if has_inline_blank else 150
+            if len(raw_txt) < 2 or len(raw_txt) > max_line_len or IGNORE_LINE_PATTERNS.search(raw_txt):
                 continue
 
             # 6.0 Standalone line containing parenthetical/bracket blank checkboxes
@@ -1154,6 +1361,7 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
                     context_label=above_prompt["text"] if above_prompt else None,
                     context_q_src=above_prompt,
                     container_right_pct=0.92,
+                    text_paren_cbs=text_paren_cbs,
                 ):
                     continue
 
@@ -1171,7 +1379,18 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
                     clause = re.split(r"[,;]", prefix)[-1].strip()
                     if not clause or len(clause) < 2:
                         clause = prefix
-                    fk, fl = normalize_label_to_key_and_label(clause)
+                    inline_resolved = _resolve_inline_blank_prompt(
+                        raw_txt=raw_txt,
+                        bm_start=bm.start(),
+                        bm_end=bm.end(),
+                        clause=clause,
+                        prefix=prefix,
+                    )
+                    if inline_resolved is not None:
+                        fk, fl, q_display = inline_resolved
+                    else:
+                        fk, fl = normalize_label_to_key_and_label(clause)
+                        q_display = clause
                     is_sig = bool(SIGNATURE_KEYWORDS.search(clause))
 
                     bx = round(ln["x_pct"] + ln["w_pct"] * (bm.start() / total_len), 4)
@@ -1184,7 +1403,7 @@ def _analyze_page_geometry_offline(page_scrape: Dict[str, Any]) -> List[Dict[str
                             "type": "image" if is_sig else "text",
                             "field_key": "applicant_signature" if is_sig else fk,
                             "label": "Signature" if is_sig else fl,
-                            "question_text": clause,
+                            "question_text": q_display,
                             "section": _current_section_for_y(by, sections),
                             "match_value": None,
                             "x_pct": bx,
@@ -1272,6 +1491,359 @@ def _deduplicate_field_keys_if_distinct_questions(mappings: List[Dict[str, Any]]
     return mappings
 
 
+def _enrich_field_questions_and_followups(
+    page_mappings: List[Dict[str, Any]],
+    page_scrape: Dict[str, Any],
+    allow_followup_recovery: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Ensures every detected field has full, self-contained `question_text` (even without reading the PDF)
+    and optionally recovers inline trailing write-in prompts after parenthetical checkboxes
+    (e.g. 'What/Where?', 'Why:', 'Comment:', 'Date of Completion:', 'NYSC Date:') when Vision skips them.
+    """
+    if not page_mappings:
+        return page_mappings
+
+    page_num = page_scrape["page_number"]
+    lines = page_scrape.get("lines", [])
+    sections = page_scrape.get("sections", [])
+    table_cells = page_scrape.get("geometry", {}).get("table_cells", [])
+
+    # Build (right_cell, left_column_question_text) pairs sorted in reading order
+    cell_entries: List[Tuple[Dict[str, Any], str]] = []
+    if table_cells:
+        by_row: Dict[int, List[Dict[str, Any]]] = {}
+        for c in table_cells:
+            by_row.setdefault(c["row_idx"], []).append(c)
+        for r_cells in by_row.values():
+            r_cells.sort(key=lambda c: c["col_idx"])
+            for c_pos in range(1, len(r_cells)):
+                left_lns = sorted(
+                    _rect_contains_text(r_cells[c_pos - 1], lines),
+                    key=lambda ln: (ln["y_pct"], ln["x_pct"]),
+                )
+                left_q = re.sub(
+                    r"\s+",
+                    " ",
+                    " ".join(ln["text"].strip() for ln in left_lns if ln.get("text")),
+                ).strip()
+                if left_q and not IGNORE_LINE_PATTERNS.search(left_q):
+                    cell_entries.append((r_cells[c_pos], left_q))
+
+    def _cell_contains_pt(cell: Dict[str, Any], px: float, py: float, tol: float = 0.008) -> bool:
+        return (
+            cell["x_pct"] - tol <= px <= cell["x_pct"] + cell["w_pct"] + tol
+            and cell["y_pct"] - tol <= py <= cell["y_pct"] + cell["h_pct"] + tol
+        )
+
+    def _find_cell_entry(m: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], str]]:
+        mx = float(m.get("x_pct") or 0.0)
+        my = float(m.get("y_pct") or 0.0)
+        if m.get("type") != "checkbox":
+            mx += float(m.get("width_pct") or 0.0) * 0.20
+            my += float(m.get("height_pct") or 0.0) * 0.40
+        for entry in cell_entries:
+            if _cell_contains_pt(entry[0], mx, my):
+                return entry
+        return None
+
+    def _norm_plain(s: Optional[str]) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+    # 1. Recover inline follow-up write-in prompts after parenthetical checkboxes when missed by Vision
+    if allow_followup_recovery and cell_entries:
+        used_keys = {m["field_key"] for m in page_mappings}
+        recovered_followups: List[Dict[str, Any]] = []
+
+        for cell, left_q in cell_entries:
+            inside_lns = _rect_contains_text(cell, lines)
+            for ln in inside_lns:
+                txt = ln["text"].strip()
+                matches = list(PAREN_CB_RE.finditer(txt))
+                if not matches:
+                    continue
+                tail = txt[matches[-1].end() :].strip(" .,-")
+                if len(tail) < 2 or not re.search(r"[A-Za-z]", tail):
+                    continue
+                tail_clean = tail.rstrip(":? ").strip()
+                if not tail_clean:
+                    continue
+
+                ln_cy = ln["y_pct"] + ln["h_pct"] * 0.5
+                has_text_already = any(
+                    m.get("type") in ("text", "multiline")
+                    and (
+                        _find_cell_entry(m) is not None and _find_cell_entry(m)[0] is cell
+                        or (
+                            abs((float(m["y_pct"]) + float(m.get("height_pct") or 0.02) * 0.4) - ln_cy) <= 0.032
+                            and float(m["x_pct"]) >= cell["x_pct"] - 0.02
+                        )
+                    )
+                    for m in page_mappings
+                )
+                if has_text_already:
+                    continue
+
+                # Find matching checkbox group inside this cell or horizontal band for key/label linkage
+                row_cbs = [
+                    m
+                    for m in page_mappings
+                    if m.get("type") == "checkbox"
+                    and (
+                        _cell_contains_pt(cell, float(m["x_pct"]), float(m["y_pct"]))
+                        or abs(float(m["y_pct"]) - ln_cy) <= 0.024
+                    )
+                ]
+                if row_cbs:
+                    parent_fk = row_cbs[0]["field_key"]
+                    parent_lbl = row_cbs[0].get("label") or humanize_key(parent_fk)
+                    parent_q = left_q or row_cbs[0].get("question_text") or parent_lbl
+                else:
+                    parent_fk, parent_lbl = normalize_label_to_key_and_label(left_q)
+                    parent_q = left_q
+
+                tfk, tfl = normalize_label_to_key_and_label(tail_clean)
+                full_fk = _make_followup_field_key(parent_fk, tfk)
+                base_fk = full_fk
+                suffix_num = 2
+                while full_fk in used_keys:
+                    full_fk = _make_followup_field_key(base_fk, str(suffix_num))
+                    suffix_num += 1
+                used_keys.add(full_fk)
+
+                parent_short = _smart_truncate_words(parent_lbl.rstrip("?:. "), 34)
+                clean_lbl = (
+                    f"{parent_short} — {tfl}"
+                    if _norm_plain(tfl) not in _norm_plain(parent_lbl)
+                    else parent_lbl
+                )
+                full_q = f"{parent_q.rstrip()} — {tail}"
+
+                cell_right = min(0.95, cell["x_pct"] + cell["w_pct"] - 0.004)
+                start_x, by, avail_w, bh = _compute_followup_answer_box(
+                    ln=ln,
+                    container_right_pct=cell_right,
+                    cell_rect=cell,
+                )
+                recovered_followups.append(
+                    {
+                        "type": "text",
+                        "field_key": full_fk,
+                        "label": clean_lbl,
+                        "question_text": full_q,
+                        "section": row_cbs[0].get("section") if row_cbs else _current_section_for_y(by, sections),
+                        "match_value": None,
+                        "x_pct": start_x,
+                        "y_pct": by,
+                        "width_pct": avail_w,
+                        "height_pct": bh,
+                        "qx_pct": ln["x_pct"],
+                        "qy_pct": ln["y_pct"],
+                        "qw_pct": ln["w_pct"],
+                        "qh_pct": ln["h_pct"],
+                        "page_number": page_num,
+                        "font_size": 9.5,
+                        "align": "left",
+                        "confidence": 0.80,
+                        "detection_source": "geometry",
+                        "acroform_field_name": None,
+                    }
+                )
+
+        if recovered_followups:
+            page_mappings = [*page_mappings, *recovered_followups]
+
+    # 2. Strip checkbox option clutter & guarantee complete question_text across all fields
+    cb_groups: Dict[str, Dict[str, Any]] = {}
+    for m in page_mappings:
+        if m.get("type") != "checkbox":
+            continue
+        fk = m["field_key"]
+        cy = float(m["y_pct"])
+        cx = float(m["x_pct"])
+        mv = re.sub(r"[^a-z0-9]+", " ", (m.get("match_value") or "").lower()).strip()
+        grp = cb_groups.get(fk)
+        if grp is None:
+            grp = {
+                "field_key": fk,
+                "label": (m.get("label") or "").strip(),
+                "question_text": (m.get("question_text") or "").strip(),
+                "options": set(),
+                "min_y": cy,
+                "max_y": cy,
+                "min_x": cx,
+                "max_x": cx,
+            }
+            cb_groups[fk] = grp
+        else:
+            grp["min_y"] = min(grp["min_y"], cy)
+            grp["max_y"] = max(grp["max_y"], cy)
+            grp["min_x"] = min(grp["min_x"], cx)
+            grp["max_x"] = max(grp["max_x"], cx)
+            cand_q = (m.get("question_text") or "").strip()
+            if cand_q and len(cand_q) > len(grp["question_text"]):
+                grp["question_text"] = cand_q
+            cand_lbl = (m.get("label") or "").strip()
+            if cand_lbl and not grp["label"]:
+                grp["label"] = cand_lbl
+        if mv:
+            grp["options"].add(mv)
+
+    cb_keys = set(cb_groups.keys())
+
+    def _resolve_parent_cb_group(
+        my: float,
+        mx: float,
+        explicit_parent_key: Optional[str],
+        expected_opts: Optional[set[str]],
+    ) -> Optional[Dict[str, Any]]:
+        if not cb_groups:
+            return None
+
+        upward = [
+            g
+            for g in cb_groups.values()
+            if g["min_y"] <= my + 0.012 and (my - g["max_y"]) <= 0.048
+        ]
+
+        # Tier 1: Explicit Vision parent_field_key (override only if semantically incompatible
+        # with an explicit conditional trigger while a compatible upward group exists)
+        if explicit_parent_key and explicit_parent_key in cb_groups:
+            explicit_grp = cb_groups[explicit_parent_key]
+            if not expected_opts or (explicit_grp["options"] & expected_opts):
+                return explicit_grp
+            compat_up = [g for g in upward if g["options"] & expected_opts]
+            if not compat_up:
+                return explicit_grp
+            upward = compat_up
+
+        # Tier 3: Upward/same-row checkbox groups filtered by conditional trigger compatibility
+        if not upward:
+            return None
+
+        if expected_opts:
+            compat = [g for g in upward if g["options"] & expected_opts]
+            if not compat:
+                # Safe abstention: never force an incompatible adjacent parent
+                return None
+            pool = compat
+        else:
+            pool = upward
+
+        same_row_left = [
+            g for g in pool if abs(g["max_y"] - my) <= 0.008 and g["min_x"] <= mx + 0.01
+        ]
+        if same_row_left:
+            return min(
+                same_row_left,
+                key=lambda g: (0 if mx - g["max_x"] >= -0.02 else 1, abs(mx - g["max_x"])),
+            )
+
+        # Next-line follow-up: pick the closest row above, and if multiple questions share
+        # that row (e.g. Q1 on left + Q2 on right), pick the rightmost (most recent in reading order).
+        min_dy = min(max(0.0, my - g["max_y"]) for g in pool)
+        closest_row = [g for g in pool if abs(max(0.0, my - g["max_y"]) - min_dy) <= 0.008]
+        return max(closest_row, key=lambda g: g["max_x"])
+
+    for m in page_mappings:
+        explicit_parent_key = m.pop("_parent_field_key", None)
+        cell_entry = _find_cell_entry(m)
+        left_q = cell_entry[1] if cell_entry else None
+
+        if m.get("type") in ("text", "multiline"):
+            cur_q = _OPTION_CLUTTER_RE.sub("", (m.get("question_text") or "")).strip()
+            cur_lbl = _OPTION_CLUTTER_RE.sub("", (m.get("label") or "")).strip()
+            if cur_q:
+                m["question_text"] = cur_q
+            if cur_lbl:
+                m["label"] = cur_lbl
+
+            my = float(m["y_pct"])
+            mx = float(m["x_pct"])
+            trig_match = _CONDITIONAL_TRIGGER_RE.search(cur_q or cur_lbl or "")
+            expected_opts = (
+                _TRIGGER_OPTION_MAP.get(trig_match.group(1).lower())
+                if trig_match
+                else None
+            )
+            near_cb = _resolve_parent_cb_group(my, mx, explicit_parent_key, expected_opts)
+
+            # For tabular questionnaires, keep cell-scoped parent question primary
+            if left_q:
+                parent_q = left_q
+                parent_lbl = (near_cb["label"] if near_cb else None) or left_q
+            elif near_cb is not None:
+                parent_q = near_cb["question_text"] or near_cb["label"]
+                parent_lbl = near_cb["label"] or parent_q
+            else:
+                parent_q = None
+                parent_lbl = None
+
+            is_followup_prompt = bool(
+                (cur_q and _FOLLOWUP_PROMPT_RE.match(cur_q))
+                or (cur_lbl and _FOLLOWUP_PROMPT_RE.match(cur_lbl))
+                or (
+                    near_cb is not None
+                    and cur_q
+                    and len(cur_q) <= 24
+                    and " — " not in cur_q
+                    and parent_q
+                    and _norm_plain(cur_q) not in _norm_plain(parent_q)
+                )
+            )
+
+            if is_followup_prompt and parent_q and " — " not in cur_q:
+                tail_str = cur_q or cur_lbl
+                if _norm_plain(parent_q) not in _norm_plain(tail_str):
+                    m["question_text"] = f"{parent_q.rstrip()} — {tail_str}"
+                    p_lbl_clean = (parent_lbl or parent_q).rstrip("?:. ")
+                    short_tail = (cur_lbl or tail_str).rstrip("?:. ")
+                    if short_tail and _norm_plain(short_tail) not in _norm_plain(p_lbl_clean):
+                        m["label"] = f"{_smart_truncate_words(p_lbl_clean, 34)} — {short_tail}"
+
+            if m["field_key"] in cb_keys:
+                tail_src = (cur_lbl or cur_q or "details").rstrip(":? ")
+                suf_fk, _ = normalize_label_to_key_and_label(tail_src)
+                m["field_key"] = _make_followup_field_key(m["field_key"], suf_fk)
+
+        # Ensure table-row question text carries complete wrapped left-column question
+        cur_qt = (m.get("question_text") or "").strip()
+        if left_q and " — " not in cur_qt:
+            if not cur_qt or (
+                len(left_q) > len(cur_qt) + 3 and _norm_plain(left_q) != _norm_plain(cur_qt)
+            ):
+                m["question_text"] = left_q
+
+        m["label"] = (m.get("label") or humanize_key(m["field_key"])).strip()
+        qt_clean = (m.get("question_text") or m["label"]).strip()
+        qt_clean = re.sub(r"[\s:]*(?:\.{4,}|_{4,})\s*$", "", qt_clean)
+        qt_clean = re.sub(r"\s*(?:\.{4,}|_{4,})\s*", " [___] ", qt_clean)
+        qt_clean = re.sub(r"\s+", " ", qt_clean).strip()
+        m["question_text"] = qt_clean or m["label"]
+
+    return page_mappings
+
+
+def _mapping_reading_order_key(m: Any) -> Tuple[int, int, int, float]:
+    """
+    Orders fields in natural top-to-bottom, left-to-right reading order and ensures
+    inline follow-up write-in prompts (' — ') sort directly after their checkbox row.
+    """
+    is_dict = isinstance(m, dict)
+    page_num = int((m.get("page_number") if is_dict else getattr(m, "page_number", 1)) or 1)
+    y_pct = float((m.get("y_pct") if is_dict else getattr(m, "y_pct", 0.0)) or 0.0)
+    x_pct = float((m.get("x_pct") if is_dict else getattr(m, "x_pct", 0.0)) or 0.0)
+    h_pct = float((m.get("height_pct") if is_dict else getattr(m, "height_pct", 0.0)) or 0.0)
+    m_type = str((m.get("type") if is_dict else getattr(m, "type", "text")) or "text")
+    q_text = str((m.get("question_text") if is_dict else getattr(m, "question_text", "")) or "")
+    lbl = str((m.get("label") if is_dict else getattr(m, "label", "")) or "")
+
+    y_eff = y_pct if m_type == "checkbox" else (y_pct + min(0.012, max(0.0, h_pct) * 0.45))
+    y_band = int(round(y_eff / 0.015))
+    is_followup = 1 if (" — " in q_text or " — " in lbl) else 0
+    return (page_num, y_band, is_followup, round(x_pct, 3))
+
+
 # =============================================================================
 # UNIFIED 4-STAGE ORCHESTRATOR
 # =============================================================================
@@ -1291,6 +1863,7 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
     """
     scrape = scrape_pdf_document(pdf_path)
     pages = scrape["pages"]
+    page_by_num = {p["page_number"]: p for p in pages}
     scraped_storage = summarize_scraped_for_storage(scrape)
 
     all_mappings: List[Dict[str, Any]] = []
@@ -1304,6 +1877,9 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
         pt = p["page_type"]
         if pt == "acroform":
             acro_fields = _extract_acroform_mappings(p)
+            acro_fields = _enrich_field_questions_and_followups(
+                acro_fields, p, allow_followup_recovery=False
+            )
             all_mappings.extend(acro_fields)
             acroform_pages_count += 1
             methods_used.add("acroform")
@@ -1357,8 +1933,23 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
         if vision_warn:
             warnings.append(vision_warn)
         if vision_mappings:
-            all_mappings.extend(vision_mappings)
-            has_snapped = any(m["detection_source"] == "vision_snapped" for m in vision_mappings)
+            enriched_vision: List[Dict[str, Any]] = []
+            by_vpage: Dict[int, List[Dict[str, Any]]] = {}
+            for vm in vision_mappings:
+                by_vpage.setdefault(int(vm.get("page_number") or 1), []).append(vm)
+            for vpnum, vlist in sorted(by_vpage.items()):
+                ps = page_by_num.get(vpnum)
+                if ps is not None:
+                    enriched_vision.extend(
+                        _enrich_field_questions_and_followups(
+                            vlist, ps, allow_followup_recovery=True
+                        )
+                    )
+                else:
+                    enriched_vision.extend(vlist)
+
+            all_mappings.extend(enriched_vision)
+            has_snapped = any(m["detection_source"] == "vision_snapped" for m in enriched_vision)
             methods_used.add("vision_hybrid" if has_snapped else "vision")
         elif vision_inspected_pages:
             methods_used.add("vision_readonly")
@@ -1372,6 +1963,9 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
             continue
         geom_fields = _analyze_page_geometry_offline(p)
         if geom_fields:
+            geom_fields = _enrich_field_questions_and_followups(
+                geom_fields, p, allow_followup_recovery=False
+            )
             all_mappings.extend(geom_fields)
             methods_used.add("geometry")
 
@@ -1388,13 +1982,7 @@ def analyze_pdf_document(pdf_path: str, use_vision: bool = True) -> Dict[str, An
         )
 
     # Sort all mappings cleanly in reading order
-    all_mappings.sort(
-        key=lambda m: (
-            int(m.get("page_number") or 1),
-            round(float(m.get("y_pct") or 0.0), 2),
-            round(float(m.get("x_pct") or 0.0), 2),
-        )
-    )
+    all_mappings.sort(key=_mapping_reading_order_key)
     all_mappings = _deduplicate_field_keys_if_distinct_questions(all_mappings)
 
     # Determine overall primary analysis_method label
@@ -1466,14 +2054,7 @@ def build_dictionary_format_from_mappings(
         "date_yyyy": ("date_signed", "Date"),
     }
 
-    sorted_mappings = sorted(
-        mappings,
-        key=lambda m: (
-            getattr(m, "page_number", 1) or 1,
-            round(float(getattr(m, "y_pct", 0.0) or 0.0), 2),
-            round(float(getattr(m, "x_pct", 0.0) or 0.0), 2),
-        ),
-    )
+    sorted_mappings = sorted(mappings, key=_mapping_reading_order_key)
 
     for m in sorted_mappings:
         m_type = getattr(m, "type", "text") or "text"
@@ -1497,7 +2078,7 @@ def build_dictionary_format_from_mappings(
             field_map[f_key] = DetectedFieldSummary(
                 field_key=f_key,
                 label=f_label,
-                question_text=q_text,
+                question_text=(q_text or f_label),
                 section=section,
                 type=m_type,
                 options=[],
@@ -1516,7 +2097,7 @@ def build_dictionary_format_from_mappings(
                 summary.type = "multiline"
             if conf is not None and (summary.confidence is None or conf < summary.confidence):
                 summary.confidence = conf
-            if not summary.question_text and q_text:
+            if q_text and (not summary.question_text or len(q_text) > len(summary.question_text)):
                 summary.question_text = q_text
             if not summary.section and section:
                 summary.section = section

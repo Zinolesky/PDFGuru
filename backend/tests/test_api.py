@@ -254,3 +254,80 @@ def test_optional_access_token_middleware(client: TestClient):
         )
     finally:
         os.environ.pop("PDFGURU_ACCESS_TOKEN", None)
+
+
+def test_generate_pdf_mapping_overrides_non_destructive(client: TestClient):
+    """Verifies per-request `mapping_overrides` moves stamped output without mutating saved template rows."""
+    tpls = client.get("/api/templates").json()
+    assert tpls
+    tpl = next((t for t in tpls if t.get("mappings")), tpls[0])
+    target_m = next(m for m in tpl["mappings"] if m["type"] in ("text", "multiline"))
+    orig_x = target_m["x_pct"]
+    orig_y = target_m["y_pct"]
+
+    overrides = {
+        str(target_m["id"]): {
+            "x_pct": 0.45,
+            "y_pct": 0.72,
+            "width_pct": 0.30,
+            "height_pct": 0.03,
+        }
+    }
+    res = client.post(
+        "/api/generate-pdf",
+        data={
+            "template_id": str(tpl["id"]),
+            "form_data": json.dumps({target_m["field_key"]: "OVERRIDE_POS_CHECK"}),
+            "mapping_overrides": json.dumps(overrides),
+        },
+    )
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/pdf"
+
+    out_doc = pymupdf.open(stream=res.content, filetype="pdf")
+    page_idx = max(0, (target_m.get("page_number") or 1) - 1)
+    page = out_doc[page_idx]
+    hits = page.search_for("OVERRIDE_POS_CHECK")
+    assert hits
+    r = hits[0]
+    pw, ph = float(page.rect.width), float(page.rect.height)
+    out_doc.close()
+
+    assert abs((r.x0 / pw) - 0.45) < 0.03
+    assert abs((r.y0 / ph) - 0.72) < 0.04
+
+    # Original template coordinates in DB remain untouched
+    after_tpl = client.get(f"/api/templates/{tpl['id']}").json()
+    after_m = next(m for m in after_tpl["mappings"] if m["id"] == target_m["id"])
+    assert after_m["x_pct"] == pytest.approx(orig_x, abs=1e-4)
+    assert after_m["y_pct"] == pytest.approx(orig_y, abs=1e-4)
+
+
+def test_missing_pdf_templates_excluded_and_dictionary_has_questions(client: TestClient):
+    """Verifies templates whose PDF is missing on disk are hidden and every field carries `question_text`."""
+    pdf_bytes = _make_sample_pdf_bytes()
+    upload_res = client.post(
+        "/api/templates",
+        data={"document_name": "Zombie Check Doc", "auto_analyze": "true", "use_vision": "false"},
+        files={"pdf_file": ("zombie_check.pdf", pdf_bytes, "application/pdf")},
+    )
+    assert upload_res.status_code == 200
+    created = upload_res.json()
+    tid = created["id"]
+    pdf_disk_path = os.path.join(UPLOADS_DIR, created["pdf_filename"])
+
+    try:
+        # Dictionary format carries non-empty question_text on every detected field
+        dict_res = client.get(f"/api/templates/{tid}/dictionary-format")
+        assert dict_res.status_code == 200
+        fields = dict_res.json()["fields"]
+        assert fields
+        assert all((f.get("question_text") or "").strip() for f in fields)
+
+        # Simulate orphaned DB row after PDF file deletion on disk
+        if os.path.exists(pdf_disk_path):
+            os.remove(pdf_disk_path)
+        list_ids = [t["id"] for t in client.get("/api/templates").json()]
+        assert tid not in list_ids
+    finally:
+        client.delete(f"/api/templates/{tid}")

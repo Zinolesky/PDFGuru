@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -45,10 +46,13 @@ from vision_analyzer import get_gemini_api_key, get_vision_model_name
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+IS_VERCEL = os.getenv("VERCEL") == "1"
+RUNTIME_DATA_DIR = "/tmp/pdfguru" if IS_VERCEL else BASE_DIR
+
+UPLOADS_DIR = os.getenv("PDFGURU_UPLOADS_DIR") or os.path.join(RUNTIME_DATA_DIR, "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-DB_PATH = os.getenv("PDFGURU_DB_PATH") or os.path.join(BASE_DIR, "pdfguru.db")
+DB_PATH = os.getenv("PDFGURU_DB_PATH") or os.path.join(RUNTIME_DATA_DIR, "pdfguru.db")
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_MB", "25")) * 1024 * 1024
@@ -138,12 +142,45 @@ def _persist_detected_mappings(
         session.add(row)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _prune_missing_pdf_templates(session: Session) -> int:
+    """Deletes stale DocumentTemplate rows whose PDF file no longer exists on disk."""
+    removed = 0
+    for tpl in session.exec(select(DocumentTemplate)).all():
+        pdf_path = os.path.join(UPLOADS_DIR, tpl.pdf_filename)
+        if not os.path.exists(pdf_path):
+            session.delete(tpl)
+            removed += 1
+    if removed:
+        session.commit()
+    return removed
+
+
+_DB_INITIALIZED = False
+
+
+def ensure_db_initialized() -> None:
+    """Idempotently creates tables, applies SQLite migrations, and seeds default PDFs."""
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    if not IS_VERCEL and not os.getenv("PDFGURU_DB_PATH") and not os.path.exists(DB_PATH):
+        legacy_db = os.path.join(BASE_DIR, "docufill.db")
+        if os.path.exists(legacy_db):
+            try:
+                shutil.copy2(legacy_db, DB_PATH)
+            except OSError:
+                pass
     SQLModel.metadata.create_all(engine)
     _ensure_sqlite_columns()
     with Session(engine) as session:
         seed_database(session, UPLOADS_DIR)
+        _prune_missing_pdf_templates(session)
+    _DB_INITIALIZED = True
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_db_initialized()
     yield
 
 
@@ -173,7 +210,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def optional_access_token_middleware(request: Request, call_next):
-    """Enforces optional PDFGURU_ACCESS_TOKEN on /api/* endpoints (except /api/health) when set."""
+    """Ensures DB is initialized (including on serverless cold starts) and enforces optional PDFGURU_ACCESS_TOKEN."""
+    ensure_db_initialized()
     expected_token = os.getenv("PDFGURU_ACCESS_TOKEN", "").strip()
     if expected_token and request.url.path.startswith("/api/") and request.url.path != "/api/health":
         if request.method != "OPTIONS":
@@ -200,7 +238,11 @@ def health_check():
 @app.get("/api/templates", response_model=List[DocumentTemplateRead])
 def list_templates(session: Session = Depends(get_session)):
     templates = session.exec(select(DocumentTemplate).order_by(DocumentTemplate.id)).all()
-    return [_serialize_template(t) for t in templates]
+    return [
+        _serialize_template(t)
+        for t in templates
+        if os.path.exists(os.path.join(UPLOADS_DIR, t.pdf_filename))
+    ]
 
 
 @app.get("/api/templates/{template_id}", response_model=DocumentTemplateRead)
@@ -567,6 +609,72 @@ async def process_image_preview_endpoint(
         raise HTTPException(status_code=400, detail=f"Image processing failed: {exc}")
 
 
+def _apply_mapping_overrides(
+    mappings: List[FieldMapping], raw_overrides: Any
+) -> List[FieldMapping]:
+    """
+    Applies optional per-request `{mapping_id: {x_pct, y_pct, width_pct, height_pct, font_size}}`
+    coordinate overrides onto transient detached FieldMapping clones without mutating the DB.
+    """
+    if not raw_overrides:
+        return list(mappings)
+    if isinstance(raw_overrides, str):
+        raw_str = raw_overrides.strip()
+        if not raw_str:
+            return list(mappings)
+        try:
+            raw_overrides = json.loads(raw_str)
+        except Exception:
+            return list(mappings)
+
+    override_by_id: Dict[int, Dict[str, Any]] = {}
+    if isinstance(raw_overrides, dict):
+        for k, v in raw_overrides.items():
+            if isinstance(v, dict):
+                try:
+                    override_by_id[int(k)] = v
+                except (TypeError, ValueError):
+                    continue
+    elif isinstance(raw_overrides, list):
+        for v in raw_overrides:
+            if isinstance(v, dict) and v.get("id") is not None:
+                try:
+                    override_by_id[int(v["id"])] = v
+                except (TypeError, ValueError):
+                    continue
+
+    if not override_by_id:
+        return list(mappings)
+
+    resolved: List[FieldMapping] = []
+    for m in mappings:
+        patch = override_by_id.get(m.id) if m.id is not None else None
+        if not patch:
+            resolved.append(m)
+            continue
+        data = m.model_dump()
+        for coord_key in ("x_pct", "y_pct", "width_pct", "height_pct"):
+            if patch.get(coord_key) is not None:
+                try:
+                    data[coord_key] = max(0.0, min(1.0, float(patch[coord_key])))
+                except (TypeError, ValueError):
+                    pass
+        if patch.get("font_size") is not None:
+            try:
+                data["font_size"] = max(5.0, min(36.0, float(patch["font_size"])))
+            except (TypeError, ValueError):
+                pass
+        if patch.get("align") in ("left", "center", "right"):
+            data["align"] = patch["align"]
+        if patch.get("page_number") is not None:
+            try:
+                data["page_number"] = max(1, int(patch["page_number"]))
+            except (TypeError, ValueError):
+                pass
+        resolved.append(FieldMapping.model_validate(data))
+    return resolved
+
+
 @app.post("/api/generate-pdf")
 async def generate_pdf_endpoint(
     request: Request,
@@ -574,6 +682,7 @@ async def generate_pdf_endpoint(
 ):
     content_type = request.headers.get("content-type", "")
     image_slots: Dict[str, Dict[str, Any]] = {}
+    raw_mapping_overrides: Any = None
     passport_bytes: Optional[bytes] = None
     signature_bytes: Optional[bytes] = None
     witness_signature_bytes: Optional[bytes] = None
@@ -586,6 +695,7 @@ async def generate_pdf_endpoint(
     if "application/json" in content_type:
         body = await request.json()
         template_id = int(body.get("template_id"))
+        raw_mapping_overrides = body.get("mapping_overrides")
         raw_form = body.get("form_data", {})
         if isinstance(raw_form, str):
             raw_form = json.loads(raw_form)
@@ -622,6 +732,7 @@ async def generate_pdf_endpoint(
     else:
         form = await request.form()
         template_id = int(form.get("template_id"))
+        raw_mapping_overrides = form.get("mapping_overrides")
         raw_form_str = form.get("form_data", "{}")
         form_data_dict = json.loads(raw_form_str) if isinstance(raw_form_str, str) else raw_form_str
         form_data = UniversalFormData(**form_data_dict)
@@ -691,11 +802,12 @@ async def generate_pdf_endpoint(
     mappings = session.exec(
         select(FieldMapping).where(FieldMapping.template_id == template_id)
     ).all()
+    resolved_mappings = _apply_mapping_overrides(list(mappings), raw_mapping_overrides)
 
     stamped_bytes = await anyio.to_thread.run_sync(
         lambda: stamp_pdf(
             pdf_path=pdf_path,
-            mappings=list(mappings),
+            mappings=resolved_mappings,
             form_data=form_data,
             image_slots=image_slots,
             passport_bytes=passport_bytes,

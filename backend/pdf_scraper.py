@@ -363,6 +363,9 @@ def _extract_vector_geometry(page: pymupdf.Page, pw: float, ph: float) -> Dict[s
                         "h_pct": _norm(h, ph),
                         "cx_pct": _norm(x0 + w * 0.5, pw),
                         "cy_pct": _norm(y0 + h * 0.5, ph),
+                        "source": "vector",
+                        "label_before": None,
+                        "label_after": None,
                     }
                 )
             continue
@@ -393,6 +396,210 @@ def _extract_vector_geometry(page: pymupdf.Page, pw: float, ph: float) -> Dict[s
         "large_boxes": _dedupe_rects(large_boxes),
         "table_cells": table_cells,
     }
+
+
+_TEXT_SLOT_RE = re.compile(r"(?:\(([\s_]{0,6})\)|\[([\s_]{0,6})\])")
+_CHECKBOX_GLYPHS = frozenset("☐□▢")
+_RADIO_GLYPHS = frozenset("○◯")
+
+
+def _clean_slot_neighbor(segment: str, is_before: bool) -> Optional[str]:
+    """Extracts the nearest short option token adjacent to a checkbox/slot delimiter."""
+    s = (segment or "").strip()
+    if not s:
+        return None
+    if is_before:
+        # Handle "Gender: Male (  )" -> "Male"
+        sep = re.match(r"^.*[:?]\s+([A-Za-z0-9][A-Za-z0-9/\-\s]{0,36})$", s)
+        if sep:
+            s = sep.group(1).strip()
+        s = s.strip(" ,;:-•·|()[]☐□▢○◯")
+    else:
+        # Ignore follow-up questions after ":", e.g. "Why:" or "Date of Completion:"
+        if ":" in s or "?" in s:
+            before_punct = re.split(r"[:?]", s, maxsplit=1)[0].strip()
+            # If the word right after the slot itself ends with ':' or '?', it's a write-in prompt, not an option
+            if len(before_punct.split()) >= 1 and len(s) <= len(before_punct) + 2:
+                return None
+            s = before_punct
+        s = s.strip(" ,;:-•·|()[]☐□▢○◯")
+    if not s or len(s) > 48:
+        return None
+    return s
+
+
+def _extract_text_checkbox_candidates(
+    page: pymupdf.Page, pw: float, ph: float
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Uses PyMuPDF `rawdict` character bounding boxes to locate exact interior centers of
+    text-based checkboxes (`(  )`, `[  ]`, `☐`, `□`, `▢`) and radio glyphs (`○`, `◯`)
+    together with their immediately preceding/following option labels.
+    """
+    scale = max(0.5, pw / 595.0)
+    cb_out: List[Dict[str, Any]] = []
+    radio_out: List[Dict[str, Any]] = []
+
+    try:
+        raw_dict = page.get_text("rawdict")
+    except Exception:
+        return cb_out, radio_out
+
+    for block in raw_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for raw_line in block.get("lines", []):
+            chars = [
+                ch
+                for sp in raw_line.get("spans", [])
+                for ch in sp.get("chars", [])
+                if ch.get("bbox") and ch.get("c") is not None
+            ]
+            if not chars:
+                continue
+            raw_txt = "".join(ch["c"] for ch in chars)
+
+            # Collect all candidate slots on this line: (char_start, char_end, entry_dict, target_list)
+            line_slots: List[Tuple[int, int, Dict[str, Any], List[Dict[str, Any]]]] = []
+
+            for m in _TEXT_SLOT_RE.finditer(raw_txt):
+                s_idx = m.start()
+                e_idx = m.end() - 1
+                if s_idx < 0 or e_idx >= len(chars) or e_idx <= s_idx:
+                    continue
+                open_b = chars[s_idx]["bbox"]
+                close_b = chars[e_idx]["bbox"]
+                ix0 = float(open_b[2])
+                ix1 = float(close_b[0])
+                iy0 = min(float(open_b[1]), float(close_b[1]))
+                iy1 = max(float(open_b[3]), float(close_b[3]))
+                gap_w = ix1 - ix0
+                glyph_h = iy1 - iy0
+
+                if (
+                    gap_w < 2.8 * scale
+                    or gap_w > 38.0 * scale
+                    or glyph_h < 4.5 * scale
+                    or glyph_h > 30.0 * scale
+                    or abs(float(open_b[1]) - float(close_b[1])) > 6.0 * scale
+                ):
+                    continue
+
+                cx = (ix0 + ix1) * 0.5
+                cy = iy0 + glyph_h * 0.48
+                slot_h = max(6.0 * scale, glyph_h * 0.78)
+                y0_s = cy - slot_h * 0.5
+                y1_s = cy + slot_h * 0.5
+                line_slots.append(
+                    (
+                        s_idx,
+                        m.end(),
+                        {
+                            "x0": round(ix0, 2),
+                            "y0": round(y0_s, 2),
+                            "x1": round(ix1, 2),
+                            "y1": round(y1_s, 2),
+                            "x_pct": _norm(ix0, pw),
+                            "y_pct": _norm(y0_s, ph),
+                            "w_pct": _norm(max(4.0 * scale, gap_w), pw),
+                            "h_pct": _norm(slot_h, ph),
+                            "cx_pct": _norm(cx, pw),
+                            "cy_pct": _norm(cy, ph),
+                            "source": "text_paren",
+                            "label_before": None,
+                            "label_after": None,
+                        },
+                        cb_out,
+                    )
+                )
+
+            for idx_c, ch in enumerate(chars):
+                g = ch["c"]
+                if g not in _CHECKBOX_GLYPHS and g not in _RADIO_GLYPHS:
+                    continue
+                bx0, by0, bx1, by1 = [float(v) for v in ch["bbox"]]
+                bw = max(4.0 * scale, bx1 - bx0)
+                bh = max(4.0 * scale, by1 - by0)
+                if bw > 28.0 * scale or bh > 28.0 * scale:
+                    continue
+                is_radio = g in _RADIO_GLYPHS
+                line_slots.append(
+                    (
+                        idx_c,
+                        idx_c + 1,
+                        {
+                            "x0": round(bx0, 2),
+                            "y0": round(by0, 2),
+                            "x1": round(bx1, 2),
+                            "y1": round(by1, 2),
+                            "x_pct": _norm(bx0, pw),
+                            "y_pct": _norm(by0, ph),
+                            "w_pct": _norm(bw, pw),
+                            "h_pct": _norm(bh, ph),
+                            "cx_pct": _norm((bx0 + bx1) * 0.5, pw),
+                            "cy_pct": _norm((by0 + by1) * 0.5, ph),
+                            "source": "radio_glyph" if is_radio else "text_glyph",
+                            "label_before": None,
+                            "label_after": None,
+                        },
+                        radio_out if is_radio else cb_out,
+                    )
+                )
+
+            if not line_slots:
+                continue
+
+            line_slots.sort(key=lambda item: item[0])
+            for k, (cs, ce, entry, target) in enumerate(line_slots):
+                prev_end = line_slots[k - 1][1] if k > 0 else 0
+                next_start = line_slots[k + 1][0] if k + 1 < len(line_slots) else len(raw_txt)
+                entry["label_before"] = _clean_slot_neighbor(raw_txt[prev_end:cs], is_before=True)
+                entry["label_after"] = _clean_slot_neighbor(raw_txt[ce:next_start], is_before=False)
+                target.append(entry)
+
+    return cb_out, radio_out
+
+
+def _annotate_checkbox_candidate_labels(
+    candidates: List[Dict[str, Any]],
+    lines: List[Dict[str, Any]],
+) -> None:
+    """Fills missing `label_before` / `label_after` on vector/glyph candidates using row-aligned lines."""
+    for cb in candidates:
+        if cb.get("label_before") and cb.get("label_after"):
+            continue
+        cy = cb["cy_pct"]
+        cb_x0 = cb["x_pct"]
+        cb_x1 = cb["x_pct"] + cb["w_pct"]
+
+        best_left: Optional[Tuple[float, str]] = None
+        best_right: Optional[Tuple[float, str]] = None
+        for ln in lines:
+            l_cy = ln["y_pct"] + ln["h_pct"] * 0.5
+            if abs(l_cy - cy) > 0.018:
+                continue
+            lx0 = ln["x_pct"]
+            lx1 = lx0 + ln["w_pct"]
+            txt = ln["text"].strip()
+            if not txt:
+                continue
+            if not cb.get("label_before") and lx1 <= cb_x0 + 0.008:
+                gap = max(0.0, cb_x0 - lx1)
+                if gap <= 0.14 and (best_left is None or gap < best_left[0]):
+                    cand = _clean_slot_neighbor(txt, is_before=True)
+                    if cand:
+                        best_left = (gap, cand)
+            if not cb.get("label_after") and lx0 >= cb_x1 - 0.008:
+                gap = max(0.0, lx0 - cb_x1)
+                if gap <= 0.14 and (best_right is None or gap < best_right[0]):
+                    cand = _clean_slot_neighbor(txt, is_before=False)
+                    if cand:
+                        best_right = (gap, cand)
+
+        if best_left and not cb.get("label_before"):
+            cb["label_before"] = best_left[1]
+        if best_right and not cb.get("label_after"):
+            cb["label_after"] = best_right[1]
 
 
 def _detect_sections(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -569,6 +776,7 @@ def scrape_pdf_document(pdf_path: str) -> Dict[str, Any]:
         lines, total_chars = _extract_lines_from_text_dict(text_dict, pw, ph)
         image_coverage = _extract_image_coverage(page, pw, ph)
         geometry = _extract_vector_geometry(page, pw, ph)
+        text_cbs, radio_glyphs = _extract_text_checkbox_candidates(page, pw, ph)
 
         ocr_used = False
         # Optional local OCR hook when page appears scanned and Tesseract is installed
@@ -583,6 +791,13 @@ def scrape_pdf_document(pdf_path: str) -> Dict[str, Any]:
                     ocr_used = True
             except Exception:
                 pass
+
+        geometry["checkbox_candidates"] = _dedupe_rects(
+            geometry["checkbox_candidates"] + text_cbs, tol=0.004
+        )
+        geometry["radio_glyphs"] = _dedupe_rects(radio_glyphs, tol=0.004)
+        _annotate_checkbox_candidate_labels(geometry["checkbox_candidates"], lines)
+        _annotate_checkbox_candidate_labels(geometry["radio_glyphs"], lines)
 
         sections = _detect_sections(lines)
         full_text = "\n".join(ln["text"] for ln in lines)
@@ -708,11 +923,15 @@ def format_page_scrape_for_vision(page_scrape: Dict[str, Any]) -> str:
     geom = page_scrape.get("geometry", {})
     cbs = geom.get("checkbox_candidates", [])
     if cbs:
-        cb_str = ", ".join(
-            f"[{int(round(c['y_pct']*1000))},{int(round(c['x_pct']*1000))},"
-            f"{int(round((c['y_pct']+c['h_pct'])*1000))},{int(round((c['x_pct']+c['w_pct'])*1000))}]"
-            for c in cbs[:80]
-        )
+        def _fmt_cb(c: Dict[str, Any]) -> str:
+            lbl = c.get("label_before") or c.get("label_after")
+            tag = f"({lbl})" if lbl else ""
+            return (
+                f"[{int(round(c['y_pct'] * 1000))},{int(round(c['x_pct'] * 1000))},"
+                f"{int(round((c['y_pct'] + c['h_pct']) * 1000))},{int(round((c['x_pct'] + c['w_pct']) * 1000))}]{tag}"
+            )
+
+        cb_str = ", ".join(_fmt_cb(c) for c in cbs[:80])
         parts.append(f"Detected Small Checkbox/Radio Shapes: {cb_str}")
 
     boxes = (geom.get("text_boxes", []) + geom.get("table_cells", []) + geom.get("large_boxes", []))[:80]

@@ -1,11 +1,15 @@
 import base64
+import io
 import os
 import re
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Literal, Optional, Tuple
+import numpy as np
 import pymupdf
 from dotenv import load_dotenv
 from google import genai
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from pdf_scraper import format_page_scrape_for_vision
@@ -36,7 +40,7 @@ class VisionDetectedField(BaseModel):
         description="Nearest section heading on the page, or null if none.",
     )
     question_text: str = Field(
-        description="Exact question, field prompt, or label printed on the PDF."
+        description="Complete, self-contained question, prompt, or table row prompt printed on the PDF so the user understands it without viewing the PDF. Combine parent question + follow-up using ' — ' (e.g. 'Have you been part of a Software Development Team? — What/Where?'). Never include raw '( )' checkbox option lists here."
     )
     label: str = Field(
         description="Concise human-readable dictionary key label (e.g. 'First name', 'Date of birth', 'Reason for leave')."
@@ -50,6 +54,10 @@ class VisionDetectedField(BaseModel):
     match_value: Optional[str] = Field(
         default=None,
         description="Required ONLY when type is 'checkbox': the specific option label for this box (e.g. 'Yes', 'No', 'None', 'Male', 'Female', 'Full-Time'). All options of the same question MUST share the same field_key and label.",
+    )
+    parent_field_key: Optional[str] = Field(
+        default=None,
+        description="If this text/multiline field is a conditional or inline follow-up to a checkbox/choice question (e.g. 'If Yes, Project Name & Location:', 'If Other, specify:', 'Why:'), set this to the EXACT field_key of the parent checkbox question it belongs to; otherwise null.",
     )
     question_box: Optional[List[int]] = Field(
         default=None,
@@ -87,13 +95,17 @@ class PageVisionAnalysis(BaseModel):
 
 VISION_SYSTEM_PROMPT = """You are a precision universal PDF form-layout analyst.
 Your job is to inspect a page from ANY PDF document (applications, contracts, medical intake, tax forms, HR onboarding, invoices, surveys, visas, consent forms, resumes, reports, scanned paperwork) and distinguish:
-1. Printed informational prose, headings, legal clauses, read-only documents, and logos -> IGNORE these for `fields`, though you may summarize already-printed facts in `extracted_key_values`.
+1. Pure read-only informational prose, headings, instructions, and logos -> IGNORE these for `fields`, though you may summarize already-printed facts in `extracted_key_values`.
+   IMPORTANT EXCEPTION FOR AGREEMENTS, UNDERTAKINGS & LEGAL DECLARATIONS: Clauses under headings like "Agreement", "Undertaking", "Declaration", "Attestation", "Consent", or "Warranty" very often contain inline fill-in-the-blank leaders — dotted lines (`..............`), dashed lines (`--------`), underscores (`________`), or gaps inside sentences (e.g. `I/we ................ a subscriber to ...`, `I, __________, hereby declare...`, `Dated this ____ day of ______ 20__`, `Witnessed by ..............`). NEVER skip these blanks under rule 1. Extract EVERY such inline blank as `type="text"` with `answer_box` strictly over the dotted/underlined leader (not over `I/we` or surrounding words), a clear human-readable `label` (e.g. `"Subscriber / Declarant Full Name"`, `"Agreement Day"` — NEVER bare `"I/we"`), and a contextual `question_text` quoting the surrounding clause.
 2. Actual QUESTIONS / PROMPTS that expect a user to fill in an answer, tick a checkbox/radio (including `(  )` or `[  ]` blanks), attach a photo/stamp, or sign -> EXTRACT every single one.
 
 CRITICAL RULES FOR `answer_box` ([ymin, xmin, ymax, xmax] on 0-1000 scale):
-- `answer_box` MUST mark the EMPTY BLANK SPACE where the answer goes (to the right of a label on an underline, inside an empty box/table cell, inside a small checkbox square/circle or `(  )` blank, inside a blank gap in a sentence like "I, __________, agree...", or directly above a signature line).
+- `answer_box` MUST mark the EMPTY BLANK SPACE (or dotted/underlined leader) where the answer goes (to the right of a label on an underline, inside an empty box/table cell, inside a small checkbox square/circle or `(  )` blank, inside a blank gap in a sentence, or directly above a signature line).
 - NEVER place `answer_box` on top of the printed question text itself.
+- SPLIT-LINE & CURRENCY-DELIMITED FIELDS: NEVER span one `answer_box` across a printed currency symbol or inline divider (`₦`, `$`, `£`, `€`, `¥`, `NGN`, `USD`, `/`, `to`) that separates two blanks on a row (e.g. `Total Cost: ____ (amount in word) ____` followed by `________ ₦ ________`). Emit separate fields so the words box ends cleanly before any divider/symbol and the figures box starts strictly to the RIGHT of the printed currency symbol (`₦`, `$`, etc.). Include the qualifier in BOTH `label` and `question_text` (e.g. `label: "Total Cost (Amount in words)"`, `question_text: "Total Cost (Amount in words)"` and `label: "Total Cost (Amount in figures, ₦)"`, `question_text: "Total Cost (Amount in figures, ₦)"`).
 - For `checkbox` / radio options: emit ONE entry per option box or `(  )` slot, and ALL checkbox/radio options belonging to the same question MUST share the EXACT SAME `field_key` and `label` (do NOT append `_yes`, `_no`, `_ongoing`, etc. to `field_key`).
+- SAME-LINE & NEXT-LINE CONDITIONAL FOLLOW-UPS: Whenever a row, table cell, or the very next line contains a conditional/inline write-in prompt tied to a checkbox/choice question (e.g. `Yes ( ) No ( ) What/Where?`, `Yes ( ) No ( ) Why:`, `If Yes, Project Name & Location:`, `If Other, please specify:`, `Ongoing ( ) Completed ( ) Date of Completion:`, `Yes ( ) No ( ) Exempted ( ) NYSC Date:`), emit BOTH the checkbox entries AND a separate `type="text"` field for the blank write-in area. When two different questions share the same row (e.g. `Radio __ Others __ | Do you own any property...? Yes __ No __`) and the next line asks `If Yes, ...`, match the condition (`Yes`) to the parent question whose options actually include that trigger! Set BOTH `parent_field_key` to that parent's exact `field_key` AND `question_text` to `"<Parent Question> — <Follow-up Prompt>"` (e.g. `"Do you own any property with Zylus homes and Property? — If Yes, Project Name & Location:"`). NEVER leave `question_text` as bare `"Why:"` or `"What/Where?"`, NEVER include raw `( )` checkbox options inside a text field's `label` or `question_text`, and set `parent_field_key: null` for ordinary non-followup fields.
+- COMPLETE QUESTION TEXT: For every field (`checkbox`, `text`, `multiline`, `image`), `question_text` MUST be the full, self-contained question from the PDF so a user can answer accurately without opening the PDF.
 - If a checkbox option is literally `"None"`, `"N/A"`, or `"No"`, return that exact string for `match_value` — NEVER JSON `null`.
 - For photo, passport, stamp, seal, or signature regions: set `type="image"`. Use clear keys like `profile_photo`, `applicant_signature`, `witness_signature`, `company_stamp`, etc.
 - If the page has repeated fields (e.g. two signature lines or two name fields), emit each one with its own `answer_box`.
@@ -159,7 +171,12 @@ def _snap_to_vector_geometry(
                 best_dist = dist
                 best_cb = cb
         if best_cb:
-            return (best_cb["cx_pct"], best_cb["cy_pct"], 0.0, 0.0), True
+            return (
+                best_cb["cx_pct"],
+                best_cb["cy_pct"],
+                round(float(best_cb.get("w_pct") or 0.0), 4),
+                round(float(best_cb.get("h_pct") or 0.0), 4),
+            ), True
         return (round(cx, 4), round(cy, 4), 0.0, 0.0), False
 
     if field_type in ("text", "multiline"):
@@ -302,6 +319,7 @@ def _normalize_vision_checkbox_groups(
         groups.setdefault(find(i), []).append(i)
 
     lines = page_scrape.get("lines", [])
+    key_remap: Dict[str, str] = {}
 
     for grp_idxs in groups.values():
         if len(grp_idxs) >= 2:
@@ -323,6 +341,12 @@ def _normalize_vision_checkbox_groups(
                 shared_key = _slugify(shared_label)
 
             for i in grp_idxs:
+                orig_fk = results[i]["field_key"]
+                orig_stem = _strip_option_suffix(orig_fk, results[i].get("_raw_match_value"))
+                if orig_fk != shared_key:
+                    key_remap[orig_fk] = shared_key
+                if orig_stem and orig_stem != shared_key:
+                    key_remap[orig_stem] = shared_key
                 results[i]["field_key"] = shared_key
                 results[i]["label"] = shared_label
 
@@ -369,6 +393,9 @@ def _normalize_vision_checkbox_groups(
 
     for m in results:
         m.pop("_raw_match_value", None)
+        pk = m.get("_parent_field_key")
+        if pk and pk in key_remap:
+            m["_parent_field_key"] = key_remap[pk]
 
     return results
 
@@ -376,6 +403,419 @@ def _normalize_vision_checkbox_groups(
 def human_fallback(key: str) -> str:
     cleaned = re.sub(r"[_\-]+", " ", key or "").strip()
     return cleaned.capitalize() if cleaned else "Choice"
+
+
+def _norm_option_token(s: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _snap_scanned_checkbox_in_image(
+    gray_arr: np.ndarray,
+    vx: float,
+    vy: float,
+    pw_pt: float,
+    ph_pt: float,
+) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Locates a hollow square/circle checkbox contour near `(vx, vy)` on a scanned page raster
+    using lightweight local NumPy thresholding and 4-connected component analysis.
+    """
+    img_h, img_w = gray_arr.shape
+    if img_h < 20 or img_w < 20:
+        return None
+
+    pt_per_px_x = max(0.1, pw_pt / img_w)
+    pt_per_px_y = max(0.1, ph_pt / img_h)
+
+    cx_px = int(round(vx * img_w))
+    cy_px = int(round(vy * img_h))
+    rx = max(24, int(round(24.0 / pt_per_px_x)))
+    ry = max(20, int(round(20.0 / pt_per_px_y)))
+
+    px0 = max(0, cx_px - rx)
+    px1 = min(img_w, cx_px + rx)
+    py0 = max(0, cy_px - ry)
+    py1 = min(img_h, cy_px + ry)
+
+    patch = gray_arr[py0:py1, px0:px1]
+    ph_p, pw_p = patch.shape
+    if ph_p < 8 or pw_p < 8:
+        return None
+
+    bg = float(np.percentile(patch, 80))
+    thresh = max(100.0, min(195.0, bg - 42.0))
+    dark = patch < thresh
+
+    visited = np.zeros((ph_p, pw_p), dtype=bool)
+    best_dist = 22.0
+    best_box: Optional[Tuple[float, float, float, float]] = None
+
+    for sy in range(ph_p):
+        for sx in range(pw_p):
+            if not dark[sy, sx] or visited[sy, sx]:
+                continue
+            q = deque([(sy, sx)])
+            visited[sy, sx] = True
+            min_x = max_x = sx
+            min_y = max_y = sy
+            area = 0
+
+            while q:
+                cy_i, cx_i = q.popleft()
+                area += 1
+                if cx_i < min_x:
+                    min_x = cx_i
+                if cx_i > max_x:
+                    max_x = cx_i
+                if cy_i < min_y:
+                    min_y = cy_i
+                if cy_i > max_y:
+                    max_y = cy_i
+                for ny, nx in ((cy_i - 1, cx_i), (cy_i + 1, cx_i), (cy_i, cx_i - 1), (cy_i, cx_i + 1)):
+                    if 0 <= ny < ph_p and 0 <= nx < pw_p and dark[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        q.append((ny, nx))
+
+            if area < 10 or area > int(patch.size * 0.45):
+                continue
+
+            cw = max_x - min_x + 1
+            ch = max_y - min_y + 1
+            w_pt = cw * pt_per_px_x
+            h_pt = ch * pt_per_px_y
+            if not (6.0 <= w_pt <= 24.0 and 6.0 <= h_pt <= 24.0):
+                continue
+            if not (0.65 <= (w_pt / max(0.1, h_pt)) <= 1.55):
+                continue
+
+            # Ensure interior core is mostly white/hollow
+            ix0 = min_x + max(1, int(round(cw * 0.28)))
+            ix1 = max_x - max(1, int(round(cw * 0.28))) + 1
+            iy0 = min_y + max(1, int(round(ch * 0.28)))
+            iy1 = max_y - max(1, int(round(ch * 0.28))) + 1
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            inner_dark = float(np.mean(dark[iy0:iy1, ix0:ix1]))
+            if inner_dark >= 0.35:
+                continue
+
+            comp_cx = px0 + (min_x + max_x + 1) * 0.5
+            comp_cy = py0 + (min_y + max_y + 1) * 0.5
+            dist_pt = (
+                ((comp_cx - cx_px) * pt_per_px_x) ** 2 + ((comp_cy - cy_px) * pt_per_px_y) ** 2
+            ) ** 0.5
+            if dist_pt <= best_dist:
+                best_dist = dist_pt
+                best_box = (
+                    round(comp_cx / img_w, 4),
+                    round(comp_cy / img_h, 4),
+                    round(cw / img_w, 4),
+                    round(ch / img_h, 4),
+                )
+
+    return best_box
+
+
+def _snap_vision_checkboxes(
+    results: List[Dict[str, Any]],
+    geometry: Dict[str, List[Dict[str, Any]]],
+    page_scrape: Dict[str, Any],
+    png_bytes: Optional[bytes] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Post-normalization 3-tier checkbox snapper:
+      1. Row + Option-Label Match across Stage 1 `checkbox_candidates` and `radio_glyphs`
+         (recovers large Vision horizontal drifts such as 47pt offsets on multi-option rows).
+      2. Nearest unused `checkbox_candidates` / `radio_glyphs` within tight proximity.
+      3. Scanned-image hollow contour snap (Pillow/NumPy) when no vector/text layer exists.
+    """
+    cb_pool = geometry.get("checkbox_candidates", [])
+    radio_pool = geometry.get("radio_glyphs", [])
+    claimed_cb: set[int] = set()
+    claimed_radio: set[int] = set()
+    gray_arr: Optional[np.ndarray] = None
+    pw_pt = float(page_scrape.get("width") or 595.0)
+    ph_pt = float(page_scrape.get("height") or 842.0)
+
+    def _pick_best(vx: float, vy: float, mv_norm: str) -> Optional[Tuple[str, int, Dict[str, Any]]]:
+        best_rank: Optional[Tuple[int, int, float]] = None
+        best_hit: Optional[Tuple[str, int, Dict[str, Any]]] = None
+
+        pools: List[Tuple[str, int, List[Dict[str, Any]], set[int]]] = [
+            ("cb", 0, cb_pool, claimed_cb),
+            ("radio", 1, radio_pool, claimed_radio),
+        ]
+
+        # Tier 1: Same horizontal row + label_before / label_after match
+        if mv_norm:
+            for pool_name, pool_prio, items, claimed in pools:
+                for idx, cand in enumerate(items):
+                    if idx in claimed:
+                        continue
+                    dy = abs(float(cand["cy_pct"]) - vy)
+                    dx = abs(float(cand["cx_pct"]) - vx)
+                    if dy > 0.025 or dx > 0.14:
+                        continue
+                    lb_n = _norm_option_token(cand.get("label_before"))
+                    la_n = _norm_option_token(cand.get("label_after"))
+                    if mv_norm in (lb_n, la_n):
+                        match_tier = 0
+                    elif len(mv_norm) >= 3 and any(
+                        tok and (mv_norm in tok or tok in mv_norm) for tok in (lb_n, la_n)
+                    ):
+                        match_tier = 1
+                    else:
+                        continue
+                    rank = (match_tier, pool_prio, dy * 4.0 + dx)
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best_hit = (pool_name, idx, cand)
+            if best_hit is not None:
+                return best_hit
+
+        # Tier 2: Nearest unused candidate within tight proximity
+        best_dist = 0.032
+        for pool_name, pool_prio, items, claimed in pools:
+            radius_limit = 0.032 if pool_name == "cb" else 0.028
+            for idx, cand in enumerate(items):
+                if idx in claimed:
+                    continue
+                dist = ((float(cand["cx_pct"]) - vx) ** 2 + (float(cand["cy_pct"]) - vy) ** 2) ** 0.5
+                if dist < min(best_dist, radius_limit):
+                    best_dist = dist
+                    best_hit = (pool_name, idx, cand)
+        return best_hit
+
+    for m in results:
+        if m.get("type") != "checkbox":
+            continue
+        vx = float(m["x_pct"])
+        vy = float(m["y_pct"])
+        mv_norm = _norm_option_token(m.get("match_value"))
+
+        hit = _pick_best(vx, vy, mv_norm)
+        if hit is not None:
+            pool_name, idx, cand = hit
+            if pool_name == "cb":
+                claimed_cb.add(idx)
+            else:
+                claimed_radio.add(idx)
+            m["x_pct"] = cand["cx_pct"]
+            m["y_pct"] = cand["cy_pct"]
+            m["width_pct"] = cand.get("w_pct")
+            m["height_pct"] = cand.get("h_pct")
+            m["detection_source"] = "vision_snapped"
+            m["confidence"] = round(min(0.98, float(m.get("confidence") or 0.85) + 0.08), 2)
+            continue
+
+        # Tier 3: Scanned image contour snap when no vector/text candidate exists
+        if (page_scrape.get("page_type") == "scanned_image" or not cb_pool) and png_bytes:
+            if gray_arr is None:
+                try:
+                    with Image.open(io.BytesIO(png_bytes)) as im:
+                        gray_arr = np.asarray(im.convert("L"), dtype=np.uint8)
+                except Exception:
+                    gray_arr = np.empty((0, 0), dtype=np.uint8)
+            if gray_arr.size > 0:
+                contour = _snap_scanned_checkbox_in_image(gray_arr, vx, vy, pw_pt, ph_pt)
+                if contour is not None:
+                    m["x_pct"], m["y_pct"], m["width_pct"], m["height_pct"] = contour
+                    m["detection_source"] = "vision_snapped"
+                    m["confidence"] = round(min(0.96, float(m.get("confidence") or 0.82) + 0.06), 2)
+
+    return results
+
+
+_INLINE_OBSTACLE_RE = re.compile(r"^(?:[₦$£€¥/]|ngn|usd|gbp|eur)$", re.IGNORECASE)
+_INLINE_CURRENCY_CHARS_RE = re.compile(r"(?:^|[\s_])([₦$£€¥])(?:[\s_]|$)")
+_WORDS_FIELD_RE = re.compile(r"\bword(?:s)?\b", re.IGNORECASE)
+_FIGURES_FIELD_RE = re.compile(
+    r"\b(?:figure|figures|numeric|number|amount|cost|price|fee|total|naira|sum|salary|deposit|balance|payment)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_interior_digital_obstacle(
+    lines: List[Dict[str, Any]],
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+) -> Optional[Tuple[float, float]]:
+    """Finds a single short interior divider/currency glyph in scraped digital text lines."""
+    hits: List[Tuple[float, float]] = []
+    min_cx = x + w * 0.20
+    max_cx = x + w * 0.80
+    for ln in lines:
+        ly0 = float(ln["y_pct"])
+        ly1 = ly0 + float(ln["h_pct"])
+        if ly1 < y - 0.008 or ly0 > y + h + 0.008:
+            continue
+        txt = (ln.get("text") or "").strip()
+        if not txt:
+            continue
+        if len(txt) <= 5 and _INLINE_OBSTACLE_RE.match(txt):
+            obs_cx = ln["x_pct"] + ln["w_pct"] * 0.5
+            if min_cx <= obs_cx <= max_cx:
+                hits.append((float(ln["x_pct"]), float(ln["x_pct"] + ln["w_pct"])))
+            continue
+        for cm in _INLINE_CURRENCY_CHARS_RE.finditer(txt):
+            c_ratio0 = cm.start(1) / max(1, len(txt))
+            c_ratio1 = cm.end(1) / max(1, len(txt))
+            ox0 = float(ln["x_pct"] + ln["w_pct"] * c_ratio0)
+            ox1 = float(ln["x_pct"] + ln["w_pct"] * c_ratio1)
+            obs_cx = (ox0 + ox1) * 0.5
+            if min_cx <= obs_cx <= max_cx:
+                hits.append((ox0, ox1))
+
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _find_interior_scanned_obstacle(
+    gray_arr: np.ndarray,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+) -> Optional[Tuple[float, float]]:
+    """
+    Detects an isolated tall printed symbol (such as a central ₦, $, £, /) crossing an otherwise
+    thin blank underline on a scanned raster page. Returns normalized (obs_x0, obs_x1) or None.
+    """
+    img_h, img_w = gray_arr.shape
+    if img_h < 20 or img_w < 20:
+        return None
+
+    px0 = max(0, int(round(x * img_w)))
+    px1 = min(img_w, int(round((x + w) * img_w)))
+    py0 = max(0, int(round((y - 0.008) * img_h)))
+    py1 = min(img_h, int(round((y + h + 0.006) * img_h)))
+    if px1 - px0 < 20 or py1 - py0 < 8:
+        return None
+
+    crop = gray_arr[py0:py1, px0:px1] < 140
+    col_counts = crop.sum(axis=0)
+    if col_counts.size == 0:
+        return None
+
+    # Only trim when most of the band is blank/thin underline (avoid multi-word prose paragraphs)
+    med_ink = float(np.median(col_counts))
+    p90_ink = float(np.percentile(col_counts, 90))
+    if med_ink > 5.0 or p90_ink > 6.0:
+        return None
+
+    # Use baseline-relative connectivity threshold so wide double-bar glyphs (like ₦) stay one run,
+    # while requiring the cluster's peak height to be genuinely tall.
+    ink_thresh = max(8, int(round(p90_ink)) + 5)
+    tall_cols = np.where(col_counts >= ink_thresh)[0]
+    if len(tall_cols) == 0:
+        return None
+
+    bridge_px = max(6, int(round(img_w * 0.008)))
+    raw_runs: List[Tuple[int, int]] = []
+    start_c = prev_c = int(tall_cols[0])
+    for col in tall_cols[1:]:
+        c_int = int(col)
+        if c_int - prev_c > bridge_px:
+            raw_runs.append((start_c, prev_c))
+            start_c = c_int
+        prev_c = c_int
+    raw_runs.append((start_c, prev_c))
+
+    peak_thresh = max(12, int((py1 - py0) * 0.25))
+    runs = [(s, e) for s, e in raw_runs if int(col_counts[s : e + 1].max()) >= peak_thresh]
+    if len(runs) != 1:
+        return None
+
+    run_s, run_e = runs[0]
+    obs_x0 = (px0 + run_s) / img_w
+    obs_x1 = (px0 + run_e + 1) / img_w
+    obs_w = obs_x1 - obs_x0
+    obs_cx = (obs_x0 + obs_x1) * 0.5
+    if not (0.006 <= obs_w <= 0.08):
+        return None
+    if not (x + w * 0.25 <= obs_cx <= x + w * 0.75):
+        return None
+    return obs_x0, obs_x1
+
+
+def _trim_boxes_around_inline_obstacles(
+    results: List[Dict[str, Any]],
+    page_scrape: Dict[str, Any],
+    png_bytes: Optional[bytes] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Safety net for wide single-line text boxes that span across an interior printed currency
+    symbol or inline divider (e.g. `________ ₦ ________`). Trims the figures/numeric box to
+    start strictly after the symbol (or trims a words box to end before it).
+    """
+    if not results:
+        return results
+
+    lines = page_scrape.get("lines", [])
+    gray_arr: Optional[np.ndarray] = None
+
+    for m in results:
+        if m.get("type") != "text":
+            continue
+        x = float(m.get("x_pct") or 0.0)
+        y = float(m.get("y_pct") or 0.0)
+        w = float(m.get("width_pct") or 0.0)
+        h = float(m.get("height_pct") or 0.0)
+        if w < 0.35 or h > 0.045:
+            continue
+
+        obs: Optional[Tuple[float, float]] = None
+        if lines:
+            obs = _find_interior_digital_obstacle(lines, x, y, w, h)
+        if obs is None and png_bytes and (page_scrape.get("page_type") == "scanned_image" or not lines):
+            if gray_arr is None:
+                try:
+                    with Image.open(io.BytesIO(png_bytes)) as im:
+                        gray_arr = np.asarray(im.convert("L"), dtype=np.uint8)
+                except Exception:
+                    gray_arr = np.empty((0, 0), dtype=np.uint8)
+            if gray_arr.size > 0:
+                obs = _find_interior_scanned_obstacle(gray_arr, x, y, w, h)
+
+        if obs is None:
+            continue
+
+        obs_x0, obs_x1 = obs
+        combined = f"{m.get('field_key', '')} {m.get('label', '')} {m.get('question_text', '')}"
+        is_words = bool(_WORDS_FIELD_RE.search(combined))
+        is_figures = (not is_words) and bool(_FIGURES_FIELD_RE.search(combined))
+        has_words_above = any(
+            other is not m
+            and other.get("type") in ("text", "multiline")
+            and _WORDS_FIELD_RE.search(
+                f"{other.get('field_key', '')} {other.get('label', '')} {other.get('question_text', '')}"
+            )
+            and 0.0 < (y - float(other.get("y_pct") or 0.0)) <= 0.06
+            and (
+                min(x + w, float(other["x_pct"]) + float(other.get("width_pct") or 0.0))
+                - max(x, float(other["x_pct"]))
+                > 0.10
+            )
+            for other in results
+        )
+
+        if is_figures or has_words_above:
+            new_x = round(obs_x1 + 0.006, 4)
+            new_w = round((x + w) - new_x, 4)
+            if new_w >= 0.10:
+                m["x_pct"] = new_x
+                m["width_pct"] = new_w
+                m["detection_source"] = "vision_snapped"
+        elif is_words:
+            new_w = round(obs_x0 - x - 0.006, 4)
+            if new_w >= 0.10:
+                m["width_pct"] = new_w
+                m["detection_source"] = "vision_snapped"
+
+    return results
 
 
 def _analyze_single_page_vision(
@@ -391,9 +831,18 @@ def _analyze_single_page_vision(
     page_num = page_scrape["page_number"]
     geom_hints = format_page_scrape_for_vision(page_scrape)
 
+    scanned_checklist = ""
+    if page_scrape.get("page_type") == "scanned_image":
+        scanned_checklist = (
+            "\n\nSCANNED PAGE ACCURACY CHECKLIST:\n"
+            "- Scan ALL Agreements, Undertakings, Declarations, and Consent paragraphs for inline dotted/dashed/underlined blanks (e.g. `I/we ........... a subscriber...`, `Dated this ____ day of ______`). Extract each blank over its dotted/underlined leader with a descriptive label.\n"
+            "- For split rows or currency-divided lines (`________ ₦ ________`, `$`, etc.), keep figures boxes strictly to the RIGHT of the currency symbol and put `(amount in words)` / `(amount in figures)` in both `label` and `question_text`.\n"
+            "- For next-line conditional follow-ups (`If Yes, ...`, `If Other, ...`), set `parent_field_key` to the matching parent checkbox question (never an unrelated question sharing that row)."
+        )
+
     user_prompt = (
         f"Analyze PDF Page {page_num} ({page_scrape['page_type']} page) and identify EVERY fillable "
-        f"question/prompt and its exact blank answer area.\n\n"
+        f"question/prompt and its exact blank answer area.{scanned_checklist}\n\n"
         f"{geom_hints}\n\n"
         f"Return a JSON object matching the required schema."
     )
@@ -441,7 +890,12 @@ def _analyze_single_page_vision(
         ans_pct = _box1000_to_pct(f.answer_box)
         if not ans_pct:
             continue
-        snapped_rect, was_snapped = _snap_to_vector_geometry(f.type, ans_pct, geometry)
+        if f.type == "checkbox":
+            ax, ay, aw, ah = ans_pct
+            snapped_rect = (round(ax + aw * 0.5, 4), round(ay + ah * 0.5, 4), 0.0, 0.0)
+            was_snapped = False
+        else:
+            snapped_rect, was_snapped = _snap_to_vector_geometry(f.type, ans_pct, geometry)
         q_pct = _box1000_to_pct(f.question_box)
 
         sx, sy, sw, sh = snapped_rect
@@ -462,6 +916,11 @@ def _analyze_single_page_vision(
             "section": (f.section or "").strip() or None,
             "match_value": raw_mv if f.type == "checkbox" else None,
             "_raw_match_value": raw_mv if f.type == "checkbox" else None,
+            "_parent_field_key": (
+                _slugify(f.parent_field_key)
+                if f.parent_field_key and f.parent_field_key.strip()
+                else None
+            ),
             "x_pct": sx,
             "y_pct": sy,
             "width_pct": None if f.type == "checkbox" else round(max(0.03, sw), 4),
@@ -480,6 +939,8 @@ def _analyze_single_page_vision(
         results.append(mapping)
 
     results = _normalize_vision_checkbox_groups(results, page_scrape)
+    results = _snap_vision_checkboxes(results, geometry, page_scrape, png_bytes=png_bytes)
+    results = _trim_boxes_around_inline_obstacles(results, page_scrape, png_bytes=png_bytes)
     return page_num, results, page_summary, kv_list, scanned_text, None
 
 

@@ -463,3 +463,510 @@ def test_vision_checkbox_unification_none_recovery_and_readonly_skip():
         assert {m["match_value"] for m in team_m} == {"Yes", "No"}
     finally:
         os.remove(cb_path)
+
+
+def test_rawdict_paren_snapping_recovers_large_vision_drift_and_scanned_contours():
+    """
+    Verifies:
+      1. Stage 1 `rawdict` parenthetical slot centers snap Vision checkboxes even with ~47pt horizontal drift.
+      2. Scanned image-only pages snap Vision checkbox predictions onto hollow square contours.
+    """
+    # Part A: Digital PDF with `(  )` slots + severe horizontal Vision drift on Intermediate
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    row_txt = "None(  ) Beginner(  ) Intermediate(  ) Advanced(  )"
+    page.insert_text(pymupdf.Point(290, 375), row_txt, fontsize=10.5, fontname="helv")
+    pdf_path = _save_temp_pdf(doc)
+
+    # Extract true rawdict slot centers directly via Stage 1
+    from pdf_scraper import scrape_pdf_document
+
+    scrape = scrape_pdf_document(pdf_path)
+    paren_cands = [
+        c for c in scrape["pages"][0]["geometry"]["checkbox_candidates"] if c.get("source") == "text_paren"
+    ]
+    assert [c.get("label_before") for c in paren_cands] == ["None", "Beginner", "Intermediate", "Advanced"]
+    true_by_label = {c["label_before"]: c for c in paren_cands}
+
+    class DriftedVisionInteractions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "is_fillable_page": True,
+                        "page_summary": "Questionnaire with parenthetical checkboxes.",
+                        "extracted_key_values": [],
+                        "scanned_text": None,
+                        "fields": [
+                            {
+                                "section": "Profile",
+                                "question_text": "Experience Level?",
+                                "label": "Experience Level",
+                                "field_key": "experience_level",
+                                "type": "checkbox",
+                                "match_value": None,
+                                "question_box": [450, 80, 480, 260],
+                                "answer_box": [460, 505, 476, 520],
+                                "confidence": 0.85,
+                            },
+                            {
+                                "section": "Profile",
+                                "question_text": "Experience Level?",
+                                "label": "Experience Level",
+                                "field_key": "experience_level",
+                                "type": "checkbox",
+                                "match_value": "Beginner",
+                                "question_box": [450, 80, 480, 260],
+                                "answer_box": [460, 575, 476, 590],
+                                "confidence": 0.85,
+                            },
+                            {
+                                "section": "Profile",
+                                "question_text": "Experience Level?",
+                                "label": "Experience Level",
+                                "field_key": "experience_level",
+                                "type": "checkbox",
+                                "match_value": "Intermediate",
+                                "question_box": [450, 80, 480, 260],
+                                # Deliberate ~0.078 (~47pt) horizontal drift left!
+                                "answer_box": [
+                                    460,
+                                    int(round((true_by_label["Intermediate"]["cx_pct"] - 0.08) * 1000)),
+                                    476,
+                                    int(round((true_by_label["Intermediate"]["cx_pct"] - 0.072) * 1000)),
+                                ],
+                                "confidence": 0.85,
+                            },
+                        ],
+                    }
+                )
+            )
+
+    class DriftedClient:
+        def __init__(self, api_key=None, http_options=None):
+            self.interactions = DriftedVisionInteractions()
+
+    try:
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}),
+            patch("vision_analyzer.genai.Client", DriftedClient),
+        ):
+            res = analyze_pdf_document(pdf_path, use_vision=True)
+
+        assert res["analysis_method"] == "vision_hybrid"
+        by_mv = {m["match_value"]: m for m in res["mappings"] if m["type"] == "checkbox"}
+        for opt in ("None", "Beginner", "Intermediate"):
+            m = by_mv[opt]
+            assert m["detection_source"] == "vision_snapped"
+            assert m["width_pct"] and m["height_pct"]
+            assert abs(m["x_pct"] - true_by_label[opt]["cx_pct"]) < 0.001
+            assert abs(m["y_pct"] - true_by_label[opt]["cy_pct"]) < 0.001
+    finally:
+        os.remove(pdf_path)
+
+    # Part B: Scanned image-only page with hollow square box at (240..256, 200..216) on 600x850 px
+    img = Image.new("RGB", (600, 850), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([240, 200, 256, 216], outline=(20, 20, 20), width=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+
+    sdoc = pymupdf.open()
+    sp = sdoc.new_page(width=600, height=850)
+    sp.insert_image(sp.rect, stream=buf.getvalue())
+    scan_path = _save_temp_pdf(sdoc)
+
+    # True center: x=248/600=0.4133, y=208/850=0.2447; mock shifted by ~10pt
+    class ScannedBoxInteractions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "is_fillable_page": True,
+                        "page_summary": "Scanned form with square box.",
+                        "extracted_key_values": [],
+                        "scanned_text": "Agree",
+                        "fields": [
+                            {
+                                "section": None,
+                                "question_text": "Agree",
+                                "label": "Agree",
+                                "field_key": "agree",
+                                "type": "checkbox",
+                                "match_value": "Yes",
+                                "question_box": [235, 120, 255, 200],
+                                "answer_box": [228, 385, 248, 405],
+                                "confidence": 0.84,
+                            }
+                        ],
+                    }
+                )
+            )
+
+    class ScannedClient:
+        def __init__(self, api_key=None, http_options=None):
+            self.interactions = ScannedBoxInteractions()
+
+    try:
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}),
+            patch("vision_analyzer.genai.Client", ScannedClient),
+        ):
+            sres = analyze_pdf_document(scan_path, use_vision=True)
+
+        assert len(sres["mappings"]) == 1
+        sm = sres["mappings"][0]
+        assert sm["detection_source"] == "vision_snapped"
+        assert abs(sm["x_pct"] - (248.0 / 600.0)) < 0.004
+        assert abs(sm["y_pct"] - (208.0 / 850.0)) < 0.004
+    finally:
+        os.remove(scan_path)
+
+
+def test_followup_key_non_collision_and_full_question_enrichment():
+    """
+    Verifies:
+      1. Long (>48-char) checkbox questions produce distinct, non-colliding follow-up `field_key`s
+         without mid-word chopping (`Soft`), and carry full parent `question_text`.
+      2. Vision analysis recovers skipped trailing inline follow-up text fields (`What/Where?`)
+         and strips raw `Yes ( ) No ( )` option clutter while prepending the parent question.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    xs = [45, 275, 550]
+    ys = [90, 145, 200]
+    for yv in ys:
+        page.draw_line(pymupdf.Point(xs[0], yv), pymupdf.Point(xs[2], yv), color=(0.2, 0.2, 0.2), width=0.8)
+    for xv in xs:
+        page.draw_line(pymupdf.Point(xv, ys[0]), pymupdf.Point(xv, ys[2]), color=(0.2, 0.2, 0.2), width=0.8)
+
+    page.insert_text(pymupdf.Point(52, 112), "Have you been part of a Software", fontsize=9.5, fontname="helv")
+    page.insert_text(pymupdf.Point(52, 126), "Development Team?", fontsize=9.5, fontname="helv")
+    page.insert_text(pymupdf.Point(285, 118), "Yes (  ) No (  ) What/Where?", fontsize=9.5, fontname="helv")
+
+    page.insert_text(pymupdf.Point(52, 172), "Have you completed NYSC?", fontsize=9.5, fontname="helv")
+    page.insert_text(pymupdf.Point(285, 172), "Yes (  ) No (  ) NYSC Date:", fontsize=9.5, fontname="helv")
+
+    pdf_path = _save_temp_pdf(doc)
+
+    try:
+        # Part A: Offline geometry guarantees unique keys + full parent context
+        off_res = analyze_pdf_document(pdf_path, use_vision=False)
+        off_cbs = [m for m in off_res["mappings"] if m["type"] == "checkbox"]
+        off_txts = [m for m in off_res["mappings"] if m["type"] == "text"]
+        cb_keys = {m["field_key"] for m in off_cbs}
+        txt_keys = {m["field_key"] for m in off_txts}
+        assert cb_keys.isdisjoint(txt_keys)
+
+        ww_field = next(m for m in off_txts if "what" in (m.get("question_text") or "").lower())
+        assert "Soft (" not in ww_field["label"]
+        assert "software development team?" in ww_field["question_text"].lower()
+        assert "what/where" in ww_field["question_text"].lower()
+
+        # Part B: Vision misses "What/Where?" and emits cluttered "Yes ( ) No ( ) NYSC Date"
+        class PartialVisionInteractions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    output_text=json.dumps(
+                        {
+                            "is_fillable_page": True,
+                            "page_summary": "Questionnaire table.",
+                            "extracted_key_values": [],
+                            "scanned_text": None,
+                            "fields": [
+                                {
+                                    "section": None,
+                                    "question_text": "Have you been part of a Software Development Team?",
+                                    "label": "Software Development Team",
+                                    "field_key": "software_development_team",
+                                    "type": "checkbox",
+                                    "match_value": "Yes",
+                                    "question_box": [120, 85, 155, 440],
+                                    "answer_box": [130, 515, 146, 535],
+                                    "confidence": 0.9,
+                                },
+                                {
+                                    "section": None,
+                                    "question_text": "Have you been part of a Software Development Team?",
+                                    "label": "Software Development Team",
+                                    "field_key": "software_development_team",
+                                    "type": "checkbox",
+                                    "match_value": "No",
+                                    "question_box": [120, 85, 155, 440],
+                                    "answer_box": [130, 565, 146, 585],
+                                    "confidence": 0.9,
+                                },
+                                {
+                                    "section": None,
+                                    "question_text": "Have you completed NYSC?",
+                                    "label": "NYSC completed",
+                                    "field_key": "nysc_completed",
+                                    "type": "checkbox",
+                                    "match_value": "Yes",
+                                    "question_box": [195, 85, 215, 440],
+                                    "answer_box": [196, 515, 212, 535],
+                                    "confidence": 0.9,
+                                },
+                                {
+                                    "section": None,
+                                    "question_text": "Have you completed NYSC?",
+                                    "label": "NYSC completed",
+                                    "field_key": "nysc_completed",
+                                    "type": "checkbox",
+                                    "match_value": "No",
+                                    "question_box": [195, 85, 215, 440],
+                                    "answer_box": [196, 565, 212, 585],
+                                    "confidence": 0.9,
+                                },
+                                {
+                                    "section": None,
+                                    "question_text": "Yes (  ) No (  ) NYSC Date:",
+                                    "label": "Yes (  ) No (  ) NYSC Date",
+                                    "field_key": "nysc_date",
+                                    "type": "text",
+                                    "match_value": None,
+                                    "question_box": [195, 600, 215, 720],
+                                    "answer_box": [195, 725, 218, 910],
+                                    "confidence": 0.85,
+                                },
+                            ],
+                        }
+                    )
+                )
+
+        class PartialVisionClient:
+            def __init__(self, api_key=None, http_options=None):
+                self.interactions = PartialVisionInteractions()
+
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}),
+            patch("vision_analyzer.genai.Client", PartialVisionClient),
+        ):
+            vis_res = analyze_pdf_document(pdf_path, use_vision=True)
+
+        vis_maps = vis_res["mappings"]
+        vis_txts = [m for m in vis_maps if m["type"] == "text"]
+        ww_vis = next(
+            m
+            for m in vis_txts
+            if "software development team" in m["question_text"].lower()
+            and "what/where" in m["question_text"].lower()
+        )
+        team_cb_idx = max(
+            i
+            for i, m in enumerate(vis_maps)
+            if m["type"] == "checkbox" and m["field_key"] == "software_development_team"
+        )
+        assert team_cb_idx < vis_maps.index(ww_vis)
+
+        nysc_date = next(m for m in vis_txts if m["field_key"] == "nysc_date")
+        nysc_cb_idx = max(
+            i
+            for i, m in enumerate(vis_maps)
+            if m["type"] == "checkbox" and "nysc" in m["field_key"]
+        )
+        assert nysc_cb_idx < vis_maps.index(nysc_date)
+        assert "yes (" not in nysc_date["label"].lower()
+        assert "yes (" not in nysc_date["question_text"].lower()
+        assert "have you completed nysc?" in nysc_date["question_text"].lower()
+        assert "nysc date" in nysc_date["question_text"].lower()
+    finally:
+        os.remove(pdf_path)
+
+
+def test_conditional_followup_links_to_matching_option_and_abstains_safely():
+    """
+    Verifies:
+      1. When two checkbox questions share one horizontal row (Radio/Others on left, Yes/No on right),
+         a next-line 'If Yes, Project Name & Location:' follow-up links to the Yes/No question
+         rather than the closer Radio/Others checkbox — both without and with explicit parent_field_key.
+      2. When no upward checkbox group has an option matching 'If Yes', enrichment safely abstains
+         instead of attaching an incompatible parent question.
+    """
+    from pdf_analyzer import _enrich_field_questions_and_followups
+
+    page_scrape = {
+        "page_number": 3,
+        "page_type": "scanned_image",
+        "lines": [],
+        "sections": [],
+        "geometry": {"table_cells": []},
+    }
+
+    def _build_two_question_row_mappings(explicit_parent=None):
+        return [
+            {
+                "type": "checkbox",
+                "field_key": "how_did_you_know",
+                "label": "How did you get to know?",
+                "question_text": "How did you get to know about LEKKI AVANA SIGNATURE?",
+                "match_value": "Radio",
+                "x_pct": 0.117,
+                "y_pct": 0.286,
+                "page_number": 3,
+            },
+            {
+                "type": "checkbox",
+                "field_key": "how_did_you_know",
+                "label": "How did you get to know?",
+                "question_text": "How did you get to know about LEKKI AVANA SIGNATURE?",
+                "match_value": "Others",
+                "x_pct": 0.229,
+                "y_pct": 0.286,
+                "page_number": 3,
+            },
+            {
+                "type": "checkbox",
+                "field_key": "own_zylus_property",
+                "label": "Own Zylus property",
+                "question_text": "Do you own any property with Zylus homes and Property?",
+                "match_value": "Yes",
+                "x_pct": 0.747,
+                "y_pct": 0.286,
+                "page_number": 3,
+            },
+            {
+                "type": "checkbox",
+                "field_key": "own_zylus_property",
+                "label": "Own Zylus property",
+                "question_text": "Do you own any property with Zylus homes and Property?",
+                "match_value": "No",
+                "x_pct": 0.866,
+                "y_pct": 0.286,
+                "page_number": 3,
+            },
+            {
+                "type": "text",
+                "field_key": "project_name_and_location",
+                "label": "Project Name & Location",
+                "question_text": "If Yes, Project Name & Location:",
+                "match_value": None,
+                "_parent_field_key": explicit_parent,
+                "x_pct": 0.287,
+                "y_pct": 0.297,
+                "width_pct": 0.65,
+                "height_pct": 0.018,
+                "page_number": 3,
+            },
+        ]
+
+    # Case 1A: Heuristic fallback when Vision omits parent_field_key
+    res_heur = _enrich_field_questions_and_followups(_build_two_question_row_mappings(None), page_scrape)
+    followup_heur = next(m for m in res_heur if m["field_key"] == "project_name_and_location")
+    assert "_parent_field_key" not in followup_heur
+    assert "do you own any property with zylus homes and property?" in followup_heur["question_text"].lower()
+    assert "if yes, project name & location" in followup_heur["question_text"].lower()
+    assert "how did you get to know" not in followup_heur["question_text"].lower()
+
+    # Case 1B: Explicit Vision parent_field_key
+    res_exp = _enrich_field_questions_and_followups(
+        _build_two_question_row_mappings("own_zylus_property"),
+        page_scrape,
+    )
+    followup_exp = next(m for m in res_exp if m["field_key"] == "project_name_and_location")
+    assert "do you own any property" in followup_exp["question_text"].lower()
+
+    # Case 2: Safe abstention when only Radio/Others exists above an "If Yes" prompt
+    incompat_only = [
+        m for m in _build_two_question_row_mappings(None) if m["field_key"] != "own_zylus_property"
+    ]
+    res_abstain = _enrich_field_questions_and_followups(incompat_only, page_scrape)
+    followup_abstain = next(m for m in res_abstain if m["field_key"] == "project_name_and_location")
+    assert followup_abstain["question_text"] == "If Yes, Project Name & Location:"
+
+
+def test_scanned_currency_obstacle_trims_figures_box_right_of_symbol():
+    """
+    Verifies `_trim_boxes_around_inline_obstacles` trims a wide single-line figures field
+    crossing a central scanned currency symbol (e.g. '________ ₦ ________') so writing
+    starts strictly after the symbol while clean single-line underlines remain untouched.
+    """
+    from vision_analyzer import _trim_boxes_around_inline_obstacles
+
+    img_w, img_h = 1000, 1400
+    img = Image.new("L", (img_w, img_h), color=255)
+    draw = ImageDraw.Draw(img)
+
+    # Row 1: clean single underline for words box (no interior tall ink)
+    draw.rectangle([160, 972, 940, 974], fill=20)
+
+    # Row 2: left underline + bold central currency symbol + right underline
+    draw.rectangle([60, 1016, 495, 1018], fill=20)
+    draw.rectangle([545, 1016, 940, 1018], fill=20)
+    # Draw bold central N-with-bars glyph spanning x=508..532, y=990..1018
+    draw.rectangle([508, 990, 513, 1018], fill=10)
+    draw.rectangle([527, 990, 532, 1018], fill=10)
+    draw.line([(510, 992), (530, 1016)], fill=10, width=4)
+    draw.rectangle([505, 1001, 535, 1004], fill=10)
+    draw.rectangle([505, 1007, 535, 1010], fill=10)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    page_scrape = {"page_number": 3, "page_type": "scanned_image", "lines": []}
+    results = [
+        {
+            "type": "text",
+            "field_key": "total_cost_words",
+            "label": "Total Cost amount in word",
+            "question_text": "Total Cost:",
+            "x_pct": 0.16,
+            "y_pct": 0.681,
+            "width_pct": 0.782,
+            "height_pct": 0.018,
+            "detection_source": "vision",
+        },
+        {
+            "type": "text",
+            "field_key": "total_cost_figures",
+            "label": "Total Cost amount in figures",
+            "question_text": "Total Cost Amount:",
+            "x_pct": 0.061,
+            "y_pct": 0.711,
+            "width_pct": 0.882,
+            "height_pct": 0.018,
+            "detection_source": "vision",
+        },
+    ]
+
+    trimmed = _trim_boxes_around_inline_obstacles(results, page_scrape, png_bytes=png_bytes)
+    words_m = next(m for m in trimmed if m["field_key"] == "total_cost_words")
+    figs_m = next(m for m in trimmed if m["field_key"] == "total_cost_figures")
+
+    assert words_m["x_pct"] == 0.16
+    assert words_m["width_pct"] == 0.782
+    assert figs_m["x_pct"] > 0.525
+    assert figs_m["width_pct"] < 0.45
+    assert figs_m["detection_source"] == "vision_snapped"
+
+
+def test_inline_dotted_agreement_blank_over_150_chars_extracted_cleanly():
+    """
+    Verifies Stage 4 offline Step 6a catches long (>150 chars) declaration/undertaking
+    dotted leaders (e.g. `I/we...........a subscriber...`) with a clean contextual label.
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text(pymupdf.Point(210, 80), "AGREEMENT & UNDERTAKING", fontsize=12, fontname="hebo")
+    agreement_line = (
+        "I/we"
+        + ("." * 115)
+        + "a subscriber to the Lekki Avana Signature do hereby acknowledge my obligation."
+    )
+    assert len(agreement_line) > 150
+    page.insert_text(pymupdf.Point(45, 130), agreement_line, fontsize=8.5, fontname="helv")
+    page.insert_text(pymupdf.Point(340, 220), "Subscriber's signature: ______________", fontsize=9.5, fontname="helv")
+    pdf_path = _save_temp_pdf(doc)
+
+    try:
+        res = analyze_pdf_document(pdf_path, use_vision=False)
+        mappings = res["mappings"]
+        sub_name = next((m for m in mappings if m["field_key"] == "subscriber_full_name"), None)
+        assert sub_name is not None
+        assert sub_name["label"] == "Subscriber full name"
+        assert "subscriber" in sub_name["question_text"].lower()
+        assert "[___]" in sub_name["question_text"]
+        assert sub_name["width_pct"] >= 0.06
+    finally:
+        os.remove(pdf_path)

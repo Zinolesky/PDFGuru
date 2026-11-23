@@ -110,7 +110,7 @@ function MediaSlotCard({
       }`}
     >
       <div>
-        <div className="flex items-center gap-1.5 mb-2">
+        <div className="flex items-center gap-1.5 mb-1">
           {isSig ? (
             <PenTool className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
           ) : (
@@ -118,6 +118,12 @@ function MediaSlotCard({
           )}
           <span className="text-xs font-semibold text-slate-800 truncate">{slot.label}</span>
         </div>
+        {slot.question_text &&
+          slot.question_text.trim().toLowerCase() !== (slot.label || '').trim().toLowerCase() && (
+            <p className="text-[11px] text-slate-500 mb-2 leading-snug line-clamp-2">
+              {slot.question_text}
+            </p>
+          )}
 
         <label
           style={isSig && previewUrl ? CHECKERBOARD_BG : undefined}

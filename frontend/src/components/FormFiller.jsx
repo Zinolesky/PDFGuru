@@ -59,7 +59,7 @@ export default function FormFiller({
     return () => {
       cancelled = true;
     };
-  }, [activeTemplate?.id, activeTemplate?.mappings?.length]);
+  }, [activeTemplate]);
 
   const docSpec = serverSpec || localFallbackSpec;
 
@@ -81,12 +81,45 @@ export default function FormFiller({
   const [pasteTarget, setPasteTarget] = useState('profile_photo');
   const [profilesOpen, setProfilesOpen] = useState(false);
 
-  // Stamped PDF output & preview state
+  // Stamped PDF output & interactive preview positioning state
   const [generatingPdf, setGeneratingPdf] = useState(false);
   const [generatedPdfBlob, setGeneratedPdfBlob] = useState(null);
   const [generatedPdfUrl, setGeneratedPdfUrl] = useState(null);
   const [previewPage, setPreviewPage] = useState(1);
   const [statusMessage, setStatusMessage] = useState(null);
+
+  const [draftMappings, setDraftMappings] = useState([]);
+  const [hasPositionEdits, setHasPositionEdits] = useState(false);
+  const [adjustMode, setAdjustMode] = useState(false);
+  const [savingPositions, setSavingPositions] = useState(false);
+  const [fallbackImageUrls, setFallbackImageUrls] = useState({});
+
+  useEffect(() => {
+    setDraftMappings(
+      activeTemplate?.mappings ? activeTemplate.mappings.map((m) => ({ ...m })) : []
+    );
+    setHasPositionEdits(false);
+    setAdjustMode(false);
+  }, [activeTemplate?.id, activeTemplate?.mappings]);
+
+  // Provide instant local preview URLs for image slots even before MediaStudio mounts/finishes debouncing
+  useEffect(() => {
+    const created = [];
+    const nextUrls = {};
+    Object.entries(mediaSlots).forEach(([slotKey, cfg]) => {
+      if (cfg?.previewUrl) {
+        nextUrls[slotKey] = cfg.previewUrl;
+      } else if (cfg?.file) {
+        const u = URL.createObjectURL(cfg.file);
+        created.push(u);
+        nextUrls[slotKey] = u;
+      }
+    });
+    setFallbackImageUrls(nextUrls);
+    return () => {
+      created.forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, [mediaSlots]);
 
   const mappedPages = useMemo(() => {
     if (!activeTemplate?.mappings?.length) return [1];
@@ -479,7 +512,7 @@ export default function FormFiller({
     });
   };
 
-  const handleGeneratePdf = async () => {
+  const handleGeneratePdf = async (overrideMappings = null) => {
     if (!activeTemplate) return;
     setGeneratingPdf(true);
     setStatusMessage(null);
@@ -487,6 +520,26 @@ export default function FormFiller({
       const multipart = new FormData();
       multipart.append('template_id', String(activeTemplate.id));
       multipart.append('form_data', JSON.stringify(formData));
+
+      const sourceMappings = Array.isArray(overrideMappings) ? overrideMappings : draftMappings;
+      if (Array.isArray(overrideMappings) || hasPositionEdits) {
+        const overrides = {};
+        sourceMappings.forEach((m) => {
+          if (m.id != null) {
+            overrides[String(m.id)] = {
+              x_pct: m.x_pct,
+              y_pct: m.y_pct,
+              width_pct: m.width_pct ?? null,
+              height_pct: m.height_pct ?? null,
+              font_size: m.font_size ?? null,
+              page_number: m.page_number || 1,
+            };
+          }
+        });
+        if (Object.keys(overrides).length > 0) {
+          multipart.append('mapping_overrides', JSON.stringify(overrides));
+        }
+      }
 
       const slotsMeta = {};
       Object.entries(mediaSlots).forEach(([slotKey, cfg]) => {
@@ -515,6 +568,7 @@ export default function FormFiller({
         return URL.createObjectURL(pdfBlob);
       });
       setGeneratedPdfBlob(pdfBlob);
+      setAdjustMode(false);
       if (mappedPages.length > 0 && !mappedPages.includes(previewPage)) {
         setPreviewPage(mappedPages[0]);
       }
@@ -526,6 +580,59 @@ export default function FormFiller({
       setStatusMessage({ type: 'error', text: err.message });
     } finally {
       setGeneratingPdf(false);
+    }
+  };
+
+  const handleSavePositionsToTemplate = async () => {
+    if (!activeTemplate?.id) return;
+    setSavingPositions(true);
+    setStatusMessage(null);
+    try {
+      const payload = draftMappings.map((m) => ({
+        type: m.type,
+        field_key: m.field_key,
+        label: m.label || null,
+        question_text: m.question_text || null,
+        section: m.section || null,
+        match_value: m.type === 'checkbox' ? m.match_value || 'Yes' : null,
+        x_pct: Number(m.x_pct),
+        y_pct: Number(m.y_pct),
+        width_pct: m.width_pct != null ? Number(m.width_pct) : null,
+        height_pct: m.height_pct != null ? Number(m.height_pct) : null,
+        qx_pct: m.qx_pct ?? null,
+        qy_pct: m.qy_pct ?? null,
+        qw_pct: m.qw_pct ?? null,
+        qh_pct: m.qh_pct ?? null,
+        page_number: m.page_number || 1,
+        font_size: m.font_size != null ? Number(m.font_size) : null,
+        align: m.align || 'left',
+        confidence: m.confidence ?? 1.0,
+        detection_source: 'manual',
+        acroform_field_name: m.acroform_field_name || null,
+      }));
+      const res = await fetch(`/api/templates/${activeTemplate.id}/mappings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error('Failed to save template positions');
+      const savedList = await res.json();
+      if (onTemplatesRefresh) {
+        await onTemplatesRefresh(activeTemplate.id);
+      }
+      setHasPositionEdits(false);
+      if (generatedPdfUrl || hasAnyValue) {
+        await handleGeneratePdf(savedList);
+      } else {
+        setStatusMessage({
+          type: 'success',
+          text: 'Saved adjusted positions as the default layout for this PDF.',
+        });
+      }
+    } catch (err) {
+      setStatusMessage({ type: 'error', text: err.message });
+    } finally {
+      setSavingPositions(false);
     }
   };
 
@@ -742,7 +849,7 @@ export default function FormFiller({
           <div className="px-5 py-3.5 border-t border-slate-100 bg-slate-50/90 flex items-center gap-3">
             <button
               type="button"
-              onClick={handleGeneratePdf}
+              onClick={() => handleGeneratePdf()}
               disabled={generatingPdf || !activeTemplate}
               data-testid="generate-pdf-btn"
               className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm py-3 px-5 shadow-sm transition cursor-pointer disabled:opacity-50"
@@ -767,11 +874,41 @@ export default function FormFiller({
         <div className="lg:col-span-6 lg:sticky lg:top-18">
           <PdfPreviewPane
             activeTemplate={activeTemplate}
+            draftMappings={draftMappings}
+            formData={formData}
+            mediaPreviews={fallbackImageUrls}
             generatedPdfUrl={generatedPdfUrl}
             previewPage={previewPage}
             totalTemplatePages={totalTemplatePages}
             mappedPages={mappedPages}
+            adjustMode={adjustMode}
+            hasPositionEdits={hasPositionEdits}
+            generatingPdf={generatingPdf}
+            savingPositions={savingPositions}
             onPreviewPageChange={setPreviewPage}
+            onToggleAdjustMode={() => {
+              if (adjustMode) {
+                if (hasPositionEdits && (generatedPdfUrl || hasAnyValue)) {
+                  handleGeneratePdf(draftMappings);
+                } else {
+                  setAdjustMode(false);
+                }
+              } else {
+                setAdjustMode(true);
+              }
+            }}
+            onDraftMappingsChange={(next) => {
+              setDraftMappings(next);
+              setHasPositionEdits(true);
+            }}
+            onResetPositions={() => {
+              setDraftMappings(
+                activeTemplate?.mappings ? activeTemplate.mappings.map((m) => ({ ...m })) : []
+              );
+              setHasPositionEdits(false);
+            }}
+            onApplyAndRestamp={() => handleGeneratePdf(draftMappings)}
+            onSavePositionsToTemplate={handleSavePositionsToTemplate}
             onResetPreview={() => {
               if (generatedPdfUrl) URL.revokeObjectURL(generatedPdfUrl);
               setGeneratedPdfUrl(null);

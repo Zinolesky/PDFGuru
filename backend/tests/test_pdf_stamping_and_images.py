@@ -159,3 +159,69 @@ def test_stamp_pdf_unicode_autofit_and_custom_image_slots():
         assert len(images) == 2
     finally:
         os.remove(pdf_path)
+
+
+def test_open_checkmark_path_and_proportional_paren_sizing():
+    """
+    Verifies stamped checkmarks are open polylines (`closePath=False`, never filled/closed triangles)
+    and scale proportionally inside narrow `(  )` slots vs larger vector squares.
+    """
+    doc = pymupdf.open()
+    doc.new_page(width=612, height=792)
+    fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    doc.save(pdf_path)
+    doc.close()
+
+    try:
+        mappings = [
+            FieldMapping(
+                template_id=1,
+                type="checkbox",
+                field_key="tight_paren",
+                match_value="Yes",
+                x_pct=0.50,
+                y_pct=0.30,
+                width_pct=0.0085,  # ~5.2pt narrow paren gap
+                height_pct=0.011,  # ~8.7pt tall
+                page_number=1,
+            ),
+            FieldMapping(
+                template_id=1,
+                type="checkbox",
+                field_key="wide_box",
+                match_value="Yes",
+                x_pct=0.50,
+                y_pct=0.50,
+                width_pct=0.024,  # ~14.7pt square box
+                height_pct=0.019,  # ~15.0pt tall
+                page_number=1,
+            ),
+        ]
+
+        stamped = stamp_pdf(
+            pdf_path=pdf_path,
+            mappings=mappings,
+            form_data={"tight_paren": "Yes", "wide_box": "Yes"},
+        )
+        out_doc = pymupdf.open(stream=stamped, filetype="pdf")
+        drawings = out_doc[0].get_drawings()
+        out_doc.close()
+
+        assert len(drawings) == 2
+        drawings.sort(key=lambda d: d["rect"].y0)
+        tight_d, wide_d = drawings[0], drawings[1]
+
+        # Open checkmark: only 2 line segments ('l'), never a closed 3-line triangle or filled shape
+        assert tight_d.get("closePath") is False
+        assert wide_d.get("closePath") is False
+        assert tight_d.get("fill") is None
+        assert len(tight_d["items"]) == 2
+        assert len(wide_d["items"]) == 2
+
+        # Narrow paren checkmark stays compact enough to avoid hitting adjacent '(' / ')' glyphs
+        assert tight_d["rect"].width < wide_d["rect"].width
+        assert tight_d["rect"].width <= 6.0
+        assert wide_d["rect"].width >= 7.0
+    finally:
+        os.remove(pdf_path)
